@@ -62,7 +62,7 @@ export PYTHONPATH=/home/fansonglin/data_space/Chenzhenxin/HAC-plus
   python analysis/plot_coview_analysis.py --output analysis_output
 ```
 
-Analysis runtime was 18.1 seconds after model/camera loading. Exactly 196 train cameras were used; the 29 test cameras were loaded by the unchanged `Scene` class but never passed to the observation builder.
+End-to-end analysis runtime, including model and camera loading, was 18.1 seconds. Exactly 196 train cameras were used; the 29 test cameras were loaded by the unchanged `Scene` class but never passed to the observation builder.
 
 ## Results
 
