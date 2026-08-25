@@ -11,6 +11,7 @@ from scene.coview_context import (
     coview_topk,
     pair_geometric_view_scores,
     spatial_topk,
+    spatial_topk_queries,
 )
 
 
@@ -117,6 +118,10 @@ def test_spatial_topk_ties_resolve_by_anchor_index():
     neighbors, distances = spatial_topk(xyz, k=2, query_chunk_size=2)
     np.testing.assert_array_equal(neighbors[0], [1, 2])
     np.testing.assert_allclose(distances[0], [1.0, 1.0])
+
+    subset_neighbors, subset_distances = spatial_topk_queries(xyz, [0, 4], k=2)
+    np.testing.assert_array_equal(subset_neighbors, neighbors[[0, 4]])
+    np.testing.assert_allclose(subset_distances, distances[[0, 4]])
 
 
 def test_geometric_descriptors_are_camera_permutation_invariant():
