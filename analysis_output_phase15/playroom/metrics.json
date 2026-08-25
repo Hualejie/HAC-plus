@@ -1,0 +1,314 @@
+{
+  "phase": "1.5",
+  "scene": "playroom",
+  "model_path": "/home/fansonglin/data_space/Chenzhenxin/HAC-plus/outputs/blending/playroom/0.004",
+  "iteration": 30000,
+  "train_camera_count": 196,
+  "valid_codec_anchor_count": 108549,
+  "voxel_size": 0.005,
+  "controlled_pool": {
+    "sampled_anchor_count": 20000,
+    "spatial_neighbors_per_anchor": 64,
+    "pair_count": 1280000,
+    "distance_match_caliper": 0.005,
+    "matched_pair_count_by_score": {
+      "binary_jaccard": 267208,
+      "geometric_distance": 49039,
+      "geometric_direction": 6598,
+      "geometric_image": 7791,
+      "geometric_depth": 30884,
+      "geometric_composite": 1358
+    }
+  },
+  "observation": {
+    "edge_count": 2874437,
+    "unobserved_anchor_count": 1,
+    "mean_cameras_per_anchor": 26.480547955301294,
+    "descriptor_fields": [
+      "distance",
+      "view_direction",
+      "image_xy",
+      "depth"
+    ],
+    "decoder_reconstructable": true,
+    "dense_anchor_camera_matrix_persisted": false,
+    "dense_anchor_pair_matrix_created": false
+  },
+  "kernel": {
+    "distance": "exp(-abs(d_i-d_k)/(0.5*(abs(d_i)+abs(d_k))+eps))",
+    "direction": "0.5*(clamp(dot(u_i,u_k),-1,1)+1)",
+    "image": "exp(-squared_ndc_distance/0.25^2)",
+    "depth": "exp(-abs(z_i-z_k)/(0.5*(abs(z_i)+abs(z_k))+eps))",
+    "composite": "equal mean of distance, direction, image, depth"
+  },
+  "score_statistics": {
+    "binary_jaccard": {
+      "mean": 0.948630154132843,
+      "std": 0.06793221831321716,
+      "min": 0.0,
+      "q25": 0.9285714030265808,
+      "median": 0.9655172228813171,
+      "q75": 1.0,
+      "max": 1.0,
+      "unique_value_count": 427
+    },
+    "geometric_distance": {
+      "mean": 0.9873970746994019,
+      "std": 0.020795442163944244,
+      "min": 0.0,
+      "q25": 0.9854950904846191,
+      "median": 0.9912308752536774,
+      "q75": 0.9949325919151306,
+      "max": 0.9999328255653381,
+      "unique_value_count": 430583
+    },
+    "geometric_direction": {
+      "mean": 0.9996868968009949,
+      "std": 0.008772660046815872,
+      "min": 0.0,
+      "q25": 0.9998208284378052,
+      "median": 0.9999179840087891,
+      "q75": 0.99996417760849,
+      "max": 1.0,
+      "unique_value_count": 46688
+    },
+    "geometric_image": {
+      "mean": 0.9426477551460266,
+      "std": 0.100371815264225,
+      "min": 0.0,
+      "q25": 0.9409447759389877,
+      "median": 0.9721714854240417,
+      "q75": 0.9876765757799149,
+      "max": 0.999994158744812,
+      "unique_value_count": 832637
+    },
+    "geometric_depth": {
+      "mean": 0.9863576889038086,
+      "std": 0.020793918520212173,
+      "min": 0.0,
+      "q25": 0.9841244667768478,
+      "median": 0.990184098482132,
+      "q75": 0.9941010028123856,
+      "max": 0.9998708963394165,
+      "unique_value_count": 447751
+    },
+    "geometric_composite": {
+      "mean": 0.9790222644805908,
+      "std": 0.033283788710832596,
+      "min": 0.0,
+      "q25": 0.9776984304189682,
+      "median": 0.9878965318202972,
+      "q75": 0.993487611413002,
+      "max": 0.9999406337738037,
+      "unique_value_count": 574902
+    },
+    "common_camera_count": {
+      "mean": 25.926090240478516,
+      "std": 6.6223978996276855,
+      "min": 0.0,
+      "q25": 22.0,
+      "median": 27.0,
+      "q75": 31.0,
+      "max": 41.0,
+      "unique_value_count": 42
+    }
+  },
+  "controlled_trends": {
+    "binary_jaccard": {
+      "feature_cosine": {
+        "supporting_bins": 0,
+        "valid_bins": 10,
+        "support_fraction": 0.0,
+        "mean_high_minus_low": -0.00508473813533783
+      },
+      "feature_l2": {
+        "supporting_bins": 1,
+        "valid_bins": 10,
+        "support_fraction": 0.1,
+        "mean_high_minus_low": 0.0628702163696289
+      },
+      "scaling_l2": {
+        "supporting_bins": 10,
+        "valid_bins": 10,
+        "support_fraction": 1.0,
+        "mean_high_minus_low": -0.002090369910001755
+      },
+      "offset_l2": {
+        "supporting_bins": 2,
+        "valid_bins": 10,
+        "support_fraction": 0.2,
+        "mean_high_minus_low": 0.040816974639892575
+      }
+    },
+    "geometric_distance": {
+      "feature_cosine": {
+        "supporting_bins": 4,
+        "valid_bins": 10,
+        "support_fraction": 0.4,
+        "mean_high_minus_low": -0.0033349484205245973
+      },
+      "feature_l2": {
+        "supporting_bins": 1,
+        "valid_bins": 10,
+        "support_fraction": 0.1,
+        "mean_high_minus_low": 0.11171875
+      },
+      "scaling_l2": {
+        "supporting_bins": 9,
+        "valid_bins": 10,
+        "support_fraction": 0.9,
+        "mean_high_minus_low": -0.004755882546305656
+      },
+      "offset_l2": {
+        "supporting_bins": 0,
+        "valid_bins": 10,
+        "support_fraction": 0.0,
+        "mean_high_minus_low": 0.11496973037719727
+      }
+    },
+    "geometric_direction": {
+      "feature_cosine": {
+        "supporting_bins": 8,
+        "valid_bins": 10,
+        "support_fraction": 0.8,
+        "mean_high_minus_low": 0.021488451957702638
+      },
+      "feature_l2": {
+        "supporting_bins": 8,
+        "valid_bins": 10,
+        "support_fraction": 0.8,
+        "mean_high_minus_low": -0.20184898376464844
+      },
+      "scaling_l2": {
+        "supporting_bins": 0,
+        "valid_bins": 10,
+        "support_fraction": 0.0,
+        "mean_high_minus_low": 0.011225929111242294
+      },
+      "offset_l2": {
+        "supporting_bins": 3,
+        "valid_bins": 10,
+        "support_fraction": 0.3,
+        "mean_high_minus_low": 0.018921947479248045
+      }
+    },
+    "geometric_image": {
+      "feature_cosine": {
+        "supporting_bins": 9,
+        "valid_bins": 10,
+        "support_fraction": 0.9,
+        "mean_high_minus_low": 0.0353420153260231
+      },
+      "feature_l2": {
+        "supporting_bins": 10,
+        "valid_bins": 10,
+        "support_fraction": 1.0,
+        "mean_high_minus_low": -0.32546329498291016
+      },
+      "scaling_l2": {
+        "supporting_bins": 1,
+        "valid_bins": 10,
+        "support_fraction": 0.1,
+        "mean_high_minus_low": 0.009424695372581482
+      },
+      "offset_l2": {
+        "supporting_bins": 6,
+        "valid_bins": 10,
+        "support_fraction": 0.6,
+        "mean_high_minus_low": 0.011454582214355469
+      }
+    },
+    "geometric_depth": {
+      "feature_cosine": {
+        "supporting_bins": 5,
+        "valid_bins": 10,
+        "support_fraction": 0.5,
+        "mean_high_minus_low": 0.003069213032722473
+      },
+      "feature_l2": {
+        "supporting_bins": 3,
+        "valid_bins": 10,
+        "support_fraction": 0.3,
+        "mean_high_minus_low": 0.0600830078125
+      },
+      "scaling_l2": {
+        "supporting_bins": 8,
+        "valid_bins": 10,
+        "support_fraction": 0.8,
+        "mean_high_minus_low": -0.004409509152173996
+      },
+      "offset_l2": {
+        "supporting_bins": 2,
+        "valid_bins": 10,
+        "support_fraction": 0.2,
+        "mean_high_minus_low": 0.1081040382385254
+      }
+    },
+    "geometric_composite": {
+      "feature_cosine": {
+        "supporting_bins": 10,
+        "valid_bins": 10,
+        "support_fraction": 1.0,
+        "mean_high_minus_low": 0.055975872278213504
+      },
+      "feature_l2": {
+        "supporting_bins": 9,
+        "valid_bins": 10,
+        "support_fraction": 0.9,
+        "mean_high_minus_low": -0.5125699043273926
+      },
+      "scaling_l2": {
+        "supporting_bins": 3,
+        "valid_bins": 10,
+        "support_fraction": 0.3,
+        "mean_high_minus_low": 0.014419984817504884
+      },
+      "offset_l2": {
+        "supporting_bins": 8,
+        "valid_bins": 10,
+        "support_fraction": 0.8,
+        "mean_high_minus_low": -0.477687931060791
+      }
+    }
+  },
+  "comparison": {
+    "binary_jaccard": {
+      "scaling_supporting_bins": 10,
+      "scaling_mean_high_minus_low": -0.002090369910001755,
+      "offset_supporting_bins": 2,
+      "feature_cosine_supporting_bins": 0
+    },
+    "geometric_distance": {
+      "scaling_supporting_bins": 9,
+      "scaling_mean_high_minus_low": -0.004755882546305656,
+      "offset_supporting_bins": 0,
+      "feature_cosine_supporting_bins": 4
+    },
+    "geometric_direction": {
+      "scaling_supporting_bins": 0,
+      "scaling_mean_high_minus_low": 0.011225929111242294,
+      "offset_supporting_bins": 3,
+      "feature_cosine_supporting_bins": 8
+    },
+    "geometric_image": {
+      "scaling_supporting_bins": 1,
+      "scaling_mean_high_minus_low": 0.009424695372581482,
+      "offset_supporting_bins": 6,
+      "feature_cosine_supporting_bins": 9
+    },
+    "geometric_depth": {
+      "scaling_supporting_bins": 8,
+      "scaling_mean_high_minus_low": -0.004409509152173996,
+      "offset_supporting_bins": 2,
+      "feature_cosine_supporting_bins": 5
+    },
+    "geometric_composite": {
+      "scaling_supporting_bins": 3,
+      "scaling_mean_high_minus_low": 0.014419984817504884,
+      "offset_supporting_bins": 8,
+      "feature_cosine_supporting_bins": 10
+    }
+  },
+  "geometric_composite_improves_scaling_over_binary": false,
+  "runtime_seconds": 29.864773511886597
+}

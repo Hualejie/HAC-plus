@@ -53,9 +53,10 @@ def main():
         fractions = []
         for metrics in scene_metrics:
             trend = metrics["controlled_trends"][score]["scaling_l2"]
+            matched = metrics["controlled_pool"]["matched_pair_count_by_score"][score]
             fields.append(
                 f"{metrics['scene']}: {trend['supporting_bins']}/{trend['valid_bins']}, "
-                f"delta={trend['mean_high_minus_low']:.6f}"
+                f"delta={trend['mean_high_minus_low']:.6f}, n={matched:,}"
             )
             deltas.append(trend["mean_high_minus_low"])
             fractions.append(trend["support_fraction"])
