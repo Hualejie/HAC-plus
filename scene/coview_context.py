@@ -35,6 +35,17 @@ class ObservationRelation:
     num_anchors: int
 
 
+@dataclass(frozen=True)
+class GeometricObservationDescriptors:
+    """Decoder-reconstructable geometry stored in Anchor→Camera CSR edge order."""
+
+    relation: ObservationRelation
+    distance: np.ndarray
+    view_direction: np.ndarray
+    image_xy: np.ndarray
+    depth: np.ndarray
+
+
 def canonicalize_codec_anchors(
     anchor: torch.Tensor,
     mask_anchor: torch.Tensor,
@@ -311,26 +322,47 @@ def spatial_topk(
     query_chunk_size: int = 4096,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Deterministic Euclidean Top-K, including exact boundary ties."""
+    xyz = np.asarray(xyz, dtype=np.float64)
+    return spatial_topk_queries(
+        xyz,
+        np.arange(xyz.shape[0], dtype=np.int64),
+        k=k,
+        query_chunk_size=query_chunk_size,
+    )
+
+
+def spatial_topk_queries(
+    xyz: np.ndarray,
+    query_indices: np.ndarray,
+    k: int = 8,
+    query_chunk_size: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Deterministic Euclidean Top-K for a bounded anchor subset."""
     from scipy.spatial import cKDTree
 
     xyz = np.asarray(xyz, dtype=np.float64)
+    query_indices = np.asarray(query_indices, dtype=np.int64).reshape(-1)
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError("xyz must have shape [N, 3]")
     if k <= 0 or k >= xyz.shape[0]:
         raise ValueError("k must satisfy 0 < k < num_anchors")
+    if query_indices.size and (query_indices.min() < 0 or query_indices.max() >= xyz.shape[0]):
+        raise ValueError("query index outside xyz")
 
     tree = cKDTree(xyz)
-    initial_dist, _ = tree.query(xyz, k=k + 1, workers=-1)
+    query_xyz = xyz[query_indices]
+    initial_dist, _ = tree.query(query_xyz, k=k + 1, workers=-1)
     boundary = initial_dist[:, k]
-    neighbors = np.empty((xyz.shape[0], k), dtype=np.int64)
-    distances = np.empty((xyz.shape[0], k), dtype=np.float64)
+    neighbors = np.empty((query_indices.size, k), dtype=np.int64)
+    distances = np.empty((query_indices.size, k), dtype=np.float64)
 
-    for start in range(0, xyz.shape[0], query_chunk_size):
-        end = min(start + query_chunk_size, xyz.shape[0])
+    for start in range(0, query_indices.size, query_chunk_size):
+        end = min(start + query_chunk_size, query_indices.size)
         radii = boundary[start:end] + np.maximum(1.0, boundary[start:end]) * 1e-12
-        candidate_lists = tree.query_ball_point(xyz[start:end], radii, workers=-1)
+        candidate_lists = tree.query_ball_point(query_xyz[start:end], radii, workers=-1)
         for local_idx, candidates in enumerate(candidate_lists):
-            anchor_idx = start + local_idx
+            query_row = start + local_idx
+            anchor_idx = query_indices[query_row]
             candidate_idx = np.asarray(candidates, dtype=np.int64)
             candidate_idx = candidate_idx[candidate_idx != anchor_idx]
             delta = xyz[candidate_idx] - xyz[anchor_idx]
@@ -338,8 +370,8 @@ def spatial_topk(
             order = np.lexsort((candidate_idx, candidate_dist))[:k]
             if order.size != k:
                 raise RuntimeError("failed to produce k spatial neighbours")
-            neighbors[anchor_idx] = candidate_idx[order]
-            distances[anchor_idx] = candidate_dist[order]
+            neighbors[query_row] = candidate_idx[order]
+            distances[query_row] = candidate_dist[order]
     return neighbors, distances
 
 
@@ -362,3 +394,195 @@ def pair_coview_scores(
         out=np.zeros(intersection.shape, dtype=np.float32),
         where=union > 0,
     )
+
+
+def build_geometric_observation_descriptors(
+    codec_xyz: torch.Tensor,
+    cameras: Sequence,
+    relation: Optional[ObservationRelation] = None,
+) -> GeometricObservationDescriptors:
+    """Compute sparse per-observation geometry without appearance or rasterisation.
+
+    Descriptors contain camera-anchor distance, world-space unit viewing
+    direction, normalized image coordinates (NDC x/y), and camera-space depth.
+    All values depend only on codec xyz and train-camera geometry.
+    """
+    if codec_xyz.ndim != 2 or codec_xyz.shape[1] != 3:
+        raise ValueError("codec_xyz must have shape [N, 3]")
+    if relation is None:
+        relation = build_geometry_observations(codec_xyz, cameras)
+    if relation.num_anchors != codec_xyz.shape[0]:
+        raise ValueError("relation and codec_xyz anchor counts differ")
+
+    sorted_cameras = sorted(cameras, key=camera_sort_key)
+    keys = tuple(camera_sort_key(camera) for camera in sorted_cameras)
+    if keys != relation.camera_keys:
+        raise ValueError("camera set does not match the observation relation")
+
+    device = codec_xyz.device
+    dtype = codec_xyz.dtype
+    edge_anchor_parts = []
+    edge_camera_parts = []
+    distance_parts = []
+    direction_parts = []
+    image_xy_parts = []
+    depth_parts = []
+
+    for camera_id, (camera, anchor_indices) in enumerate(
+        zip(sorted_cameras, relation.camera_to_anchor)
+    ):
+        if anchor_indices.size == 0:
+            continue
+        index_tensor = torch.as_tensor(anchor_indices, device=device, dtype=torch.long)
+        xyz = codec_xyz[index_tensor]
+        ones = torch.ones((xyz.shape[0], 1), device=device, dtype=dtype)
+        xyz_h = torch.cat((xyz, ones), dim=1)
+        world_view = torch.as_tensor(camera.world_view_transform, device=device, dtype=dtype)
+        full_proj = torch.as_tensor(camera.full_proj_transform, device=device, dtype=dtype)
+        camera_center = torch.linalg.inv(world_view)[3, :3]
+
+        camera_delta = xyz - camera_center[None, :]
+        distance = torch.linalg.norm(camera_delta, dim=1)
+        direction = camera_delta / torch.clamp(distance[:, None], min=1e-12)
+        camera_space = xyz_h @ world_view
+        clip = xyz_h @ full_proj
+        image_xy = clip[:, :2] / torch.clamp(clip[:, 3:4], min=1e-12)
+
+        edge_anchor_parts.append(anchor_indices.astype(np.int64, copy=False))
+        edge_camera_parts.append(np.full(anchor_indices.size, camera_id, dtype=np.int32))
+        distance_parts.append(distance.cpu().numpy().astype(np.float32, copy=False))
+        direction_parts.append(direction.cpu().numpy().astype(np.float32, copy=False))
+        image_xy_parts.append(image_xy.cpu().numpy().astype(np.float32, copy=False))
+        depth_parts.append(camera_space[:, 2].cpu().numpy().astype(np.float32, copy=False))
+
+    if not edge_anchor_parts:
+        empty = np.empty(0, dtype=np.float32)
+        return GeometricObservationDescriptors(
+            relation=relation,
+            distance=empty,
+            view_direction=np.empty((0, 3), dtype=np.float32),
+            image_xy=np.empty((0, 2), dtype=np.float32),
+            depth=empty,
+        )
+
+    edge_anchor = np.concatenate(edge_anchor_parts)
+    edge_camera = np.concatenate(edge_camera_parts)
+    edge_order = np.lexsort((edge_camera, edge_anchor))
+    ordered_camera = edge_camera[edge_order]
+    if not np.array_equal(ordered_camera, relation.anchor_camera_ids):
+        raise RuntimeError("descriptor edge order does not match relation CSR")
+
+    return GeometricObservationDescriptors(
+        relation=relation,
+        distance=np.concatenate(distance_parts)[edge_order],
+        view_direction=np.concatenate(direction_parts, axis=0)[edge_order],
+        image_xy=np.concatenate(image_xy_parts, axis=0)[edge_order],
+        depth=np.concatenate(depth_parts)[edge_order],
+    )
+
+
+def pair_geometric_view_scores(
+    descriptors: GeometricObservationDescriptors,
+    source: np.ndarray,
+    target: np.ndarray,
+    image_sigma: float = 0.25,
+    batch_size: int = 4096,
+) -> Dict[str, np.ndarray]:
+    """Compare observation geometry for arbitrary anchor pairs.
+
+    Each component is averaged over common cameras. Distance and depth use a
+    relative Laplacian kernel, direction uses rescaled cosine similarity, and
+    normalized image coordinates use an RBF kernel. ``geometric_composite`` is
+    their equal-weight mean. Sparse CSR matrices are densified only for bounded
+    pair batches, never for all anchors and cameras.
+    """
+    from scipy.sparse import csr_matrix
+
+    source = np.asarray(source, dtype=np.int64).reshape(-1)
+    target = np.asarray(target, dtype=np.int64).reshape(-1)
+    if source.shape != target.shape:
+        raise ValueError("source and target must have the same shape")
+    if image_sigma <= 0 or batch_size <= 0:
+        raise ValueError("image_sigma and batch_size must be positive")
+
+    relation = descriptors.relation
+    shape = (relation.num_anchors, len(relation.camera_keys))
+    indices = relation.anchor_camera_ids
+    indptr = relation.anchor_indptr
+
+    def sparse(values):
+        return csr_matrix((values, indices, indptr), shape=shape, copy=False)
+
+    incidence = sparse(np.ones(indices.size, dtype=np.float32))
+    distance = sparse(descriptors.distance)
+    direction = tuple(sparse(descriptors.view_direction[:, axis]) for axis in range(3))
+    image_xy = tuple(sparse(descriptors.image_xy[:, axis]) for axis in range(2))
+    depth = sparse(descriptors.depth)
+
+    names = (
+        "binary_jaccard",
+        "geometric_distance",
+        "geometric_direction",
+        "geometric_image",
+        "geometric_depth",
+        "geometric_composite",
+        "common_camera_count",
+    )
+    output = {name: np.empty(source.size, dtype=np.float32) for name in names}
+    epsilon = 1e-8
+
+    for start in range(0, source.size, batch_size):
+        end = min(start + batch_size, source.size)
+        src = source[start:end]
+        dst = target[start:end]
+        src_mask = incidence[src].toarray() > 0
+        dst_mask = incidence[dst].toarray() > 0
+        common = src_mask & dst_mask
+        common_count = common.sum(axis=1)
+        union_count = (src_mask | dst_mask).sum(axis=1)
+        denominator = np.maximum(common_count, 1)
+
+        src_distance = distance[src].toarray()
+        dst_distance = distance[dst].toarray()
+        distance_scale = 0.5 * (np.abs(src_distance) + np.abs(dst_distance)) + epsilon
+        distance_kernel = np.exp(-np.abs(src_distance - dst_distance) / distance_scale)
+        distance_score = (distance_kernel * common).sum(axis=1) / denominator
+
+        direction_dot = np.zeros(common.shape, dtype=np.float32)
+        for matrix in direction:
+            direction_dot += matrix[src].toarray() * matrix[dst].toarray()
+        direction_kernel = 0.5 * (np.clip(direction_dot, -1.0, 1.0) + 1.0)
+        direction_score = (direction_kernel * common).sum(axis=1) / denominator
+
+        image_sq_distance = np.zeros(common.shape, dtype=np.float32)
+        for matrix in image_xy:
+            delta = matrix[src].toarray() - matrix[dst].toarray()
+            image_sq_distance += delta * delta
+        image_kernel = np.exp(-image_sq_distance / (image_sigma * image_sigma))
+        image_score = (image_kernel * common).sum(axis=1) / denominator
+
+        src_depth = depth[src].toarray()
+        dst_depth = depth[dst].toarray()
+        depth_scale = 0.5 * (np.abs(src_depth) + np.abs(dst_depth)) + epsilon
+        depth_kernel = np.exp(-np.abs(src_depth - dst_depth) / depth_scale)
+        depth_score = (depth_kernel * common).sum(axis=1) / denominator
+
+        valid = common_count > 0
+        component_scores = (distance_score, direction_score, image_score, depth_score)
+        for values in component_scores:
+            values[~valid] = 0.0
+        composite = np.mean(np.stack(component_scores, axis=1), axis=1)
+
+        output["binary_jaccard"][start:end] = np.divide(
+            common_count,
+            union_count,
+            out=np.zeros(common_count.shape, dtype=np.float32),
+            where=union_count > 0,
+        )
+        output["geometric_distance"][start:end] = distance_score
+        output["geometric_direction"][start:end] = direction_score
+        output["geometric_image"][start:end] = image_score
+        output["geometric_depth"][start:end] = depth_score
+        output["geometric_composite"][start:end] = composite
+        output["common_camera_count"][start:end] = common_count
+    return output

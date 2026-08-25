@@ -5,9 +5,11 @@ import torch
 
 from scene.coview_context import (
     ObservationRelation,
+    build_geometric_observation_descriptors,
     build_geometry_observations,
     canonicalize_codec_anchors,
     coview_topk,
+    pair_geometric_view_scores,
     spatial_topk,
 )
 
@@ -115,3 +117,35 @@ def test_spatial_topk_ties_resolve_by_anchor_index():
     neighbors, distances = spatial_topk(xyz, k=2, query_chunk_size=2)
     np.testing.assert_array_equal(neighbors[0], [1, 2])
     np.testing.assert_allclose(distances[0], [1.0, 1.0])
+
+
+def test_geometric_descriptors_are_camera_permutation_invariant():
+    xyz = torch.tensor([[0.0, 0.0, 0.5], [0.1, 0.0, 0.5], [0.8, 0.0, 0.5]])
+    cameras = [_camera("b", 1), _camera("a", 0)]
+    first_relation = build_geometry_observations(xyz, cameras)
+    second_relation = build_geometry_observations(xyz, list(reversed(cameras)))
+    first = build_geometric_observation_descriptors(xyz, cameras, first_relation)
+    second = build_geometric_observation_descriptors(xyz, list(reversed(cameras)), second_relation)
+
+    np.testing.assert_allclose(first.distance, second.distance)
+    np.testing.assert_allclose(first.view_direction, second.view_direction)
+    np.testing.assert_allclose(first.image_xy, second.image_xy)
+    np.testing.assert_allclose(first.depth, second.depth)
+
+
+def test_geometric_view_score_resolves_saturated_binary_jaccard():
+    xyz = torch.tensor([[0.0, 0.0, 0.5], [0.1, 0.0, 0.5], [0.8, 0.0, 0.5]])
+    cameras = [_camera("a", 0), _camera("b", 1)]
+    relation = build_geometry_observations(xyz, cameras)
+    descriptors = build_geometric_observation_descriptors(xyz, cameras, relation)
+    scores = pair_geometric_view_scores(
+        descriptors,
+        source=np.asarray([0, 0]),
+        target=np.asarray([1, 2]),
+        batch_size=1,
+    )
+
+    np.testing.assert_allclose(scores["binary_jaccard"], [1.0, 1.0])
+    assert scores["geometric_image"][0] > scores["geometric_image"][1]
+    assert scores["geometric_composite"][0] > scores["geometric_composite"][1]
+    np.testing.assert_array_equal(scores["common_camera_count"], [2.0, 2.0])
