@@ -90,6 +90,9 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         dataset.update_init_factor,
         dataset.update_hierachy_factor,
         dataset.use_feat_bank,
+        use_view_topology=dataset.use_view_topology,
+        view_topology_k=dataset.view_topology_k,
+        view_topology_candidates=dataset.view_topology_candidates,
         n_features_per_level=args_param.n_features,
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
@@ -133,6 +136,13 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        if (
+            gaussians.use_view_topology
+            and iteration > opt.update_until
+            and not gaussians.has_training_view_topology
+        ):
+            gaussians.refresh_training_view_topology()
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -426,6 +436,9 @@ def render_sets(args_param, dataset : ModelParams, iteration : int, pipeline : P
             dataset.update_init_factor,
             dataset.update_hierachy_factor,
             dataset.use_feat_bank,
+            use_view_topology=dataset.use_view_topology,
+            view_topology_k=dataset.view_topology_k,
+            view_topology_candidates=dataset.view_topology_candidates,
             n_features_per_level=args_param.n_features,
             log2_hashmap_size=args_param.log2,
             log2_hashmap_size_2D=args_param.log2_2D,

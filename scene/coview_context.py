@@ -7,6 +7,7 @@ It mirrors the anchor filtering, quantisation, and canonical sorting performed b
 
 from dataclasses import dataclass
 import heapq
+from types import SimpleNamespace
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -44,6 +45,20 @@ class GeometricObservationDescriptors:
     view_direction: np.ndarray
     image_xy: np.ndarray
     depth: np.ndarray
+
+
+@dataclass(frozen=True)
+class ViewTopologyContext:
+    """Fixed-width topology features derived from a sparse anchor graph."""
+
+    features: np.ndarray
+    neighbors: np.ndarray
+    distance_scores: np.ndarray
+    depth_scores: np.ndarray
+    diagnostics: Dict[str, object]
+
+
+VIEW_TOPOLOGY_FEATURE_DIM = 15
 
 
 def canonicalize_codec_anchors(
@@ -90,6 +105,44 @@ def camera_sort_key(camera) -> Tuple[str, int, int]:
         int(getattr(camera, "colmap_id", -1)),
         int(getattr(camera, "uid", -1)),
     )
+
+
+def extract_camera_geometry(cameras: Sequence) -> Tuple[SimpleNamespace, ...]:
+    """Detach the small decoder-side camera contract from image-bearing cameras."""
+    geometry = []
+    for camera in sorted(cameras, key=camera_sort_key):
+        geometry.append(SimpleNamespace(
+            image_name=str(getattr(camera, "image_name", "")),
+            colmap_id=int(getattr(camera, "colmap_id", -1)),
+            uid=int(getattr(camera, "uid", -1)),
+            full_proj_transform=torch.as_tensor(camera.full_proj_transform).detach().cpu(),
+            world_view_transform=torch.as_tensor(camera.world_view_transform).detach().cpu(),
+            image_width=int(camera.image_width),
+            image_height=int(camera.image_height),
+            znear=float(camera.znear),
+            zfar=float(camera.zfar),
+        ))
+    return tuple(geometry)
+
+
+def camera_geometry_state(cameras: Sequence) -> Tuple[Dict[str, object], ...]:
+    """Return a torch-serializable camera geometry package."""
+    return tuple({
+        "image_name": camera.image_name,
+        "colmap_id": camera.colmap_id,
+        "uid": camera.uid,
+        "full_proj_transform": camera.full_proj_transform,
+        "world_view_transform": camera.world_view_transform,
+        "image_width": camera.image_width,
+        "image_height": camera.image_height,
+        "znear": camera.znear,
+        "zfar": camera.zfar,
+    } for camera in extract_camera_geometry(cameras))
+
+
+def camera_geometry_from_state(state: Sequence[Mapping[str, object]]) -> Tuple[SimpleNamespace, ...]:
+    """Restore and canonicalize the camera geometry package."""
+    return extract_camera_geometry([SimpleNamespace(**dict(item)) for item in state])
 
 
 def build_geometry_observations(
@@ -586,3 +639,202 @@ def pair_geometric_view_scores(
         output["geometric_composite"][start:end] = composite
         output["common_camera_count"][start:end] = common_count
     return output
+
+
+def pair_distance_depth_scores(
+    descriptors: GeometricObservationDescriptors,
+    source: np.ndarray,
+    target: np.ndarray,
+    batch_size: int = 8192,
+) -> Dict[str, np.ndarray]:
+    """Evaluate only the two Phase 1.5-supported edge components.
+
+    This avoids materializing the unused direction and image-plane kernels when
+    building the codec graph. Dense arrays are bounded by ``batch_size`` times
+    the camera count; an anchor-square matrix is never constructed.
+    """
+    from scipy.sparse import csr_matrix
+
+    source = np.asarray(source, dtype=np.int64).reshape(-1)
+    target = np.asarray(target, dtype=np.int64).reshape(-1)
+    if source.shape != target.shape:
+        raise ValueError("source and target must have the same shape")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    relation = descriptors.relation
+    shape = (relation.num_anchors, len(relation.camera_keys))
+    indices = relation.anchor_camera_ids
+    indptr = relation.anchor_indptr
+
+    def sparse(values):
+        return csr_matrix((values, indices, indptr), shape=shape, copy=False)
+
+    incidence = sparse(np.ones(indices.size, dtype=np.float32))
+    distance = sparse(descriptors.distance)
+    depth = sparse(descriptors.depth)
+    output = {
+        "geometric_distance": np.empty(source.size, dtype=np.float32),
+        "geometric_depth": np.empty(source.size, dtype=np.float32),
+        "common_camera_count": np.empty(source.size, dtype=np.float32),
+    }
+    epsilon = 1e-8
+
+    for start in range(0, source.size, batch_size):
+        end = min(start + batch_size, source.size)
+        src = source[start:end]
+        dst = target[start:end]
+        src_mask = incidence[src].toarray() > 0
+        dst_mask = incidence[dst].toarray() > 0
+        common = src_mask & dst_mask
+        common_count = common.sum(axis=1)
+        denominator = np.maximum(common_count, 1)
+
+        src_distance = distance[src].toarray()
+        dst_distance = distance[dst].toarray()
+        distance_scale = 0.5 * (np.abs(src_distance) + np.abs(dst_distance)) + epsilon
+        distance_kernel = np.exp(-np.abs(src_distance - dst_distance) / distance_scale)
+        distance_score = (distance_kernel * common).sum(axis=1) / denominator
+
+        src_depth = depth[src].toarray()
+        dst_depth = depth[dst].toarray()
+        depth_scale = 0.5 * (np.abs(src_depth) + np.abs(dst_depth)) + epsilon
+        depth_kernel = np.exp(-np.abs(src_depth - dst_depth) / depth_scale)
+        depth_score = (depth_kernel * common).sum(axis=1) / denominator
+
+        invalid = common_count == 0
+        distance_score[invalid] = 0.0
+        depth_score[invalid] = 0.0
+        output["geometric_distance"][start:end] = distance_score
+        output["geometric_depth"][start:end] = depth_score
+        output["common_camera_count"][start:end] = common_count
+    return output
+
+
+def build_view_topology_context(
+    codec_xyz: torch.Tensor,
+    cameras: Sequence,
+    candidate_k: int = 16,
+    topk: int = 8,
+    feature_quantization: float = 1e-5,
+    pair_batch_size: int = 8192,
+) -> ViewTopologyContext:
+    """Build a deterministic distance/depth-induced inter-anchor graph.
+
+    View Top-K is selected from deterministic Euclidean candidates. The output
+    reads no anchor attribute: its fixed-width feature consists only of edge
+    score statistics, common-camera support, and weighted relative xyz. Final
+    quantization is part of the codec contract and suppresses insignificant
+    cross-device floating-point differences.
+    """
+    if codec_xyz.ndim != 2 or codec_xyz.shape[1] != 3:
+        raise ValueError("codec_xyz must have shape [N, 3]")
+    if not 0 < topk <= candidate_k < codec_xyz.shape[0]:
+        raise ValueError("require 0 < topk <= candidate_k < num_anchors")
+    if feature_quantization <= 0:
+        raise ValueError("feature_quantization must be positive")
+
+    camera_geometry = extract_camera_geometry(cameras)
+    xyz = codec_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
+    candidate_neighbors, candidate_distances = spatial_topk(xyz, k=candidate_k)
+    source = np.repeat(np.arange(xyz.shape[0], dtype=np.int64), candidate_k)
+    target = candidate_neighbors.reshape(-1)
+
+    relation = build_geometry_observations(codec_xyz, camera_geometry)
+    descriptors = build_geometric_observation_descriptors(codec_xyz, camera_geometry, relation)
+    pair_scores = pair_distance_depth_scores(
+        descriptors,
+        source,
+        target,
+        batch_size=pair_batch_size,
+    )
+    distance_score = pair_scores["geometric_distance"].reshape(-1, candidate_k)
+    depth_score = pair_scores["geometric_depth"].reshape(-1, candidate_k)
+    common_count = pair_scores["common_camera_count"].reshape(-1, candidate_k)
+    joint_score = 0.5 * (distance_score + depth_score)
+    valid = common_count > 0
+
+    selected_offset = np.empty((xyz.shape[0], topk), dtype=np.int64)
+    for anchor_idx in range(xyz.shape[0]):
+        # Common-camera pairs rank before unsupported pairs; ties use the
+        # canonical anchor index, independent of scipy query order.
+        ranking_score = np.where(valid[anchor_idx], joint_score[anchor_idx], -1.0)
+        selected_offset[anchor_idx] = np.lexsort((
+            candidate_neighbors[anchor_idx],
+            -ranking_score,
+        ))[:topk]
+
+    row = np.arange(xyz.shape[0], dtype=np.int64)[:, None]
+    neighbors = candidate_neighbors[row, selected_offset]
+    selected_spatial_distance = candidate_distances[row, selected_offset]
+    selected_distance = distance_score[row, selected_offset]
+    selected_depth = depth_score[row, selected_offset]
+    selected_common = common_count[row, selected_offset]
+    selected_valid = selected_common > 0
+    selected_joint = 0.5 * (selected_distance + selected_depth)
+
+    valid_float = selected_valid.astype(np.float64)
+    valid_count = np.maximum(valid_float.sum(axis=1, keepdims=True), 1.0)
+
+    def supported_stats(values):
+        values = values.astype(np.float64, copy=False)
+        mean = (values * valid_float).sum(axis=1, keepdims=True) / valid_count
+        variance = (((values - mean) ** 2) * valid_float).sum(axis=1, keepdims=True) / valid_count
+        maximum = np.where(selected_valid, values, -np.inf).max(axis=1, keepdims=True)
+        maximum[~np.isfinite(maximum)] = 0.0
+        return mean, np.sqrt(np.maximum(variance, 0.0)), maximum
+
+    distance_mean, distance_std, distance_max = supported_stats(selected_distance)
+    depth_mean, depth_std, depth_max = supported_stats(selected_depth)
+    joint_mean, joint_std, joint_max = supported_stats(selected_joint)
+    valid_fraction = valid_float.mean(axis=1, keepdims=True)
+    camera_denominator = max(len(camera_geometry), 1)
+    common_fraction = (
+        selected_common.astype(np.float64) * valid_float
+    ).sum(axis=1, keepdims=True) / valid_count / camera_denominator
+
+    delta = xyz[neighbors] - xyz[:, None, :]
+    local_scale = np.maximum(
+        (selected_spatial_distance * valid_float).sum(axis=1, keepdims=True) / valid_count,
+        1e-12,
+    )
+    weights = selected_joint.astype(np.float64) * valid_float
+    weight_sum = np.maximum(weights.sum(axis=1, keepdims=True), 1e-12)
+    normalized_delta = delta / local_scale[:, :, None]
+    weighted_delta = (normalized_delta * weights[:, :, None]).sum(axis=1) / weight_sum
+    weighted_distance = (
+        selected_spatial_distance * weights
+    ).sum(axis=1, keepdims=True) / weight_sum / local_scale
+
+    features = np.concatenate((
+        distance_mean, distance_std, distance_max,
+        depth_mean, depth_std, depth_max,
+        joint_mean, joint_std, joint_max,
+        valid_fraction, common_fraction,
+        weighted_delta, weighted_distance,
+    ), axis=1)
+    if features.shape[1] != VIEW_TOPOLOGY_FEATURE_DIM:
+        raise RuntimeError("unexpected topology feature dimension")
+    features = (
+        np.round(features / feature_quantization) * feature_quantization
+    ).astype(np.float32)
+
+    diagnostics = {
+        "num_anchors": int(xyz.shape[0]),
+        "num_cameras": len(camera_geometry),
+        "candidate_k": int(candidate_k),
+        "topk": int(topk),
+        "num_candidate_pairs": int(xyz.shape[0] * candidate_k),
+        "num_observation_edges": int(relation.anchor_camera_ids.size),
+        "mean_valid_neighbor_fraction": float(valid_fraction.mean()),
+        "feature_quantization": float(feature_quantization),
+        "feature_dim": VIEW_TOPOLOGY_FEATURE_DIM,
+        "dense_anchor_pair_matrix_created": False,
+    }
+    return ViewTopologyContext(
+        features=features,
+        neighbors=neighbors,
+        distance_scores=selected_distance.astype(np.float32),
+        depth_scores=selected_depth.astype(np.float32),
+        diagnostics=diagnostics,
+    )

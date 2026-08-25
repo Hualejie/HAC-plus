@@ -11,6 +11,7 @@
 
 import os
 import time
+import hashlib
 from functools import reduce
 
 import numpy as np
@@ -36,6 +37,13 @@ from utils.encodings_cuda import \
     encoder, decoder, \
     encoder_gaussian_chunk, decoder_gaussian_chunk, encoder_gaussian_mixed_chunk, decoder_gaussian_mixed_chunk
 from utils.gpcc_utils import compress_gpcc, decompress_gpcc, calculate_morton_order
+from scene.coview_context import (
+    VIEW_TOPOLOGY_FEATURE_DIM,
+    build_view_topology_context,
+    camera_geometry_from_state,
+    camera_geometry_state,
+    extract_camera_geometry,
+)
 
 bit2MB_scale = 8 * 1024 * 1024
 MAX_batch_size = 3000
@@ -254,6 +262,9 @@ class GaussianModel(nn.Module):
                  use_2D: bool=True,
                  decoded_version: bool=False,
                  is_synthetic_nerf: bool=False,
+                 use_view_topology: bool=False,
+                 view_topology_k: int=8,
+                 view_topology_candidates: int=16,
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -281,6 +292,15 @@ class GaussianModel(nn.Module):
         self.Q = Q
         self.use_2D = use_2D
         self.decoded_version = decoded_version
+        self.use_view_topology = use_view_topology
+        self.view_topology_k = view_topology_k
+        self.view_topology_candidates = view_topology_candidates
+        if self.use_view_topology and not 0 < self.view_topology_k <= self.view_topology_candidates:
+            raise ValueError("require 0 < view_topology_k <= view_topology_candidates")
+        self._view_topology_cameras = tuple()
+        self._training_view_topology = None
+        self._training_view_topology_diagnostics = None
+        self._codec_view_topology_cache = None
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -378,6 +398,15 @@ class GaussianModel(nn.Module):
             print('find synthetic nerf, use Channel_CTX_fea_tiny')
             self.mlp_deform = Channel_CTX_fea_tiny().cuda()
 
+        if self.use_view_topology:
+            self.mlp_view_scaling = nn.Sequential(
+                nn.Linear(VIEW_TOPOLOGY_FEATURE_DIM, 32),
+                nn.ReLU(True),
+                nn.Linear(32, 12),
+            ).cuda()
+            nn.init.zeros_(self.mlp_view_scaling[-1].weight)
+            nn.init.zeros_(self.mlp_view_scaling[-1].bias)
+
         self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
         self.EG_mix_prob_2 = Entropy_gaussian_mix_prob_2(Q=1).cuda()
 
@@ -395,12 +424,125 @@ class GaussianModel(nn.Module):
             params = STE_binary.apply(params)
         return params
 
+    def _install_hash_embeddings(self, hash_embeddings):
+        if self.use_2D:
+            len_3D = self.encoding_xyz.encoding_xyz.params.shape[0]
+            len_2D = self.encoding_xyz.encoding_xy.params.shape[0]
+            self.encoding_xyz.encoding_xyz.params = nn.Parameter(hash_embeddings[0:len_3D])
+            self.encoding_xyz.encoding_xy.params = nn.Parameter(hash_embeddings[len_3D:len_3D+len_2D])
+            self.encoding_xyz.encoding_xz.params = nn.Parameter(hash_embeddings[len_3D+len_2D:len_3D+len_2D*2])
+            self.encoding_xyz.encoding_yz.params = nn.Parameter(hash_embeddings[len_3D+len_2D*2:len_3D+len_2D*3])
+        else:
+            self.encoding_xyz.params = nn.Parameter(hash_embeddings)
+
     def get_mlp_size(self, digit=32):
         mlp_size = 0
         for n, p in self.named_parameters():
             if 'mlp' in n:
                 mlp_size += p.numel()*digit
         return mlp_size, mlp_size / 8 / 1024 / 1024
+
+    def configure_view_topology_cameras(self, cameras):
+        if self.use_view_topology:
+            self._view_topology_cameras = extract_camera_geometry(cameras)
+            self._training_view_topology = None
+
+    @property
+    def has_training_view_topology(self):
+        return (
+            self._training_view_topology is not None
+            and self._training_view_topology.shape[0] == self.get_anchor.shape[0]
+        )
+
+    @staticmethod
+    def _view_topology_checksum(features):
+        array = features.detach().cpu().contiguous().numpy()
+        return hashlib.sha256(array.tobytes()).hexdigest()
+
+    @torch.no_grad()
+    def build_view_topology_features(self, anchor):
+        if not self.use_view_topology:
+            return None, None
+        if not self._view_topology_cameras:
+            raise RuntimeError("train-camera geometry is required for view topology")
+        if anchor.shape[0] <= self.view_topology_candidates:
+            features = torch.zeros(
+                (anchor.shape[0], VIEW_TOPOLOGY_FEATURE_DIM),
+                device=anchor.device,
+                dtype=anchor.dtype,
+            )
+            diagnostics = {
+                "num_anchors": int(anchor.shape[0]),
+                "insufficient_anchor_count": True,
+                "feature_dim": VIEW_TOPOLOGY_FEATURE_DIM,
+                "dense_anchor_pair_matrix_created": False,
+            }
+            diagnostics["feature_checksum"] = self._view_topology_checksum(features)
+            return features, diagnostics
+        topology = build_view_topology_context(
+            anchor,
+            self._view_topology_cameras,
+            candidate_k=self.view_topology_candidates,
+            topk=self.view_topology_k,
+        )
+        features = torch.as_tensor(topology.features, device=anchor.device, dtype=anchor.dtype)
+        diagnostics = dict(topology.diagnostics)
+        diagnostics["feature_checksum"] = self._view_topology_checksum(features)
+        return features, diagnostics
+
+    @torch.no_grad()
+    def refresh_training_view_topology(self):
+        if not self.use_view_topology:
+            return
+        valid = self.get_mask_anchor.to(torch.bool)[:, 0]
+        valid_anchor = self.get_anchor[valid]
+        valid_features, diagnostics = self.build_view_topology_features(valid_anchor)
+        full_features = torch.zeros(
+            (self.get_anchor.shape[0], VIEW_TOPOLOGY_FEATURE_DIM),
+            device=self.get_anchor.device,
+            dtype=self.get_anchor.dtype,
+        )
+        full_features[valid] = valid_features
+        self._training_view_topology = full_features
+        self._training_view_topology_diagnostics = diagnostics
+        print(f"View topology refreshed: {diagnostics}")
+
+    def training_view_topology(self, anchor_selection):
+        if not self.use_view_topology:
+            return None
+        if not self.has_training_view_topology:
+            raise RuntimeError("training view topology has not been built")
+        return self._training_view_topology[anchor_selection]
+
+    def apply_view_scaling_context(self, mean_scaling, scale_scaling, topology_features):
+        if not self.use_view_topology:
+            return mean_scaling, scale_scaling
+        if topology_features is None:
+            raise RuntimeError("view topology features are required for Scaling entropy parameters")
+        residual = self.mlp_view_scaling(topology_features)
+        mean_residual, log_scale_residual = torch.chunk(residual, 2, dim=-1)
+        mean_scaling = mean_scaling + mean_residual
+        scale_scaling = torch.clamp(scale_scaling, min=1e-9) * torch.exp(
+            torch.clamp(log_scale_residual, min=-5.0, max=5.0)
+        )
+        return mean_scaling, scale_scaling
+
+    @torch.no_grad()
+    def codec_view_topology(self, anchor, force_rebuild=False):
+        if not self.use_view_topology:
+            return None, None
+        anchor_checksum = self._view_topology_checksum(anchor)
+        if (
+            not force_rebuild
+            and self._codec_view_topology_cache is not None
+            and self._codec_view_topology_cache[0] == anchor_checksum
+        ):
+            return self._codec_view_topology_cache[1], self._codec_view_topology_cache[2]
+        features, diagnostics = self.build_view_topology_features(anchor)
+        diagnostics = dict(diagnostics)
+        diagnostics["anchor_checksum"] = anchor_checksum
+        self._codec_view_topology_cache = (anchor_checksum, features, diagnostics)
+        return features, diagnostics
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -409,6 +551,8 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.eval()
         self.mlp_grid.eval()
         self.mlp_deform.eval()
+        if self.use_view_topology:
+            self.mlp_view_scaling.eval()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
@@ -420,6 +564,8 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.train()
         self.mlp_grid.train()
         self.mlp_deform.train()
+        if self.use_view_topology:
+            self.mlp_view_scaling.train()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.train()
@@ -638,6 +784,13 @@ class GaussianModel(nn.Module):
                 {'params': self.mlp_deform.parameters(), 'lr': training_args.mlp_deform_lr_init, "name": "mlp_deform"},
             ]
 
+        if self.use_view_topology:
+            l.append({
+                'params': self.mlp_view_scaling.parameters(),
+                'lr': training_args.mlp_view_scaling_lr_init,
+                "name": "mlp_view_scaling",
+            })
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -689,6 +842,14 @@ class GaussianModel(nn.Module):
                                                     lr_final=training_args.mlp_deform_lr_final,
                                                     lr_delay_mult=training_args.mlp_deform_lr_delay_mult,
                                                     max_steps=training_args.mlp_deform_lr_max_steps)
+        if self.use_view_topology:
+            self.mlp_view_scaling_scheduler_args = get_expon_lr_func(
+                lr_init=training_args.mlp_view_scaling_lr_init,
+                lr_final=training_args.mlp_view_scaling_lr_final,
+                lr_delay_mult=training_args.mlp_view_scaling_lr_delay_mult,
+                max_steps=max(training_args.iterations - training_args.update_until, 1),
+                step_sub=training_args.update_until,
+            )
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -722,6 +883,9 @@ class GaussianModel(nn.Module):
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_deform":
                 lr = self.mlp_deform_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "mlp_view_scaling":
+                lr = self.mlp_view_scaling_scheduler_args(iteration)
                 param_group['lr'] = lr
 
     def construct_list_of_attributes(self):
@@ -1066,26 +1230,19 @@ class GaussianModel(nn.Module):
 
     def save_mlp_checkpoints(self,path):
         mkdir_p(os.path.dirname(path))
-
+        checkpoint = {
+            'opacity_mlp': self.mlp_opacity.state_dict(),
+            'cov_mlp': self.mlp_cov.state_dict(),
+            'color_mlp': self.mlp_color.state_dict(),
+            'encoding_xyz': self.encoding_xyz.state_dict(),
+            'grid_mlp': self.mlp_grid.state_dict(),
+            'deform_mlp': self.mlp_deform.state_dict(),
+        }
         if self.use_feat_bank:
-            torch.save({
-                'opacity_mlp': self.mlp_opacity.state_dict(),
-                'mlp_feature_bank': self.mlp_feature_bank.state_dict(),
-                'cov_mlp': self.mlp_cov.state_dict(),
-                'color_mlp': self.mlp_color.state_dict(),
-                'encoding_xyz': self.encoding_xyz.state_dict(),
-                'grid_mlp': self.mlp_grid.state_dict(),
-                'deform_mlp': self.mlp_deform.state_dict(),
-            }, path)
-        else:
-            torch.save({
-                'opacity_mlp': self.mlp_opacity.state_dict(),
-                'cov_mlp': self.mlp_cov.state_dict(),
-                'color_mlp': self.mlp_color.state_dict(),
-                'encoding_xyz': self.encoding_xyz.state_dict(),
-                'grid_mlp': self.mlp_grid.state_dict(),
-                'deform_mlp': self.mlp_deform.state_dict(),
-            }, path)
+            checkpoint['mlp_feature_bank'] = self.mlp_feature_bank.state_dict()
+        if self.use_view_topology:
+            checkpoint['view_scaling_mlp'] = self.mlp_view_scaling.state_dict()
+        torch.save(checkpoint, path)
 
 
     def load_mlp_checkpoints(self,path):
@@ -1098,6 +1255,10 @@ class GaussianModel(nn.Module):
         self.encoding_xyz.load_state_dict(checkpoint['encoding_xyz'])
         self.mlp_grid.load_state_dict(checkpoint['grid_mlp'])
         self.mlp_deform.load_state_dict(checkpoint['deform_mlp'])
+        if self.use_view_topology:
+            if 'view_scaling_mlp' not in checkpoint:
+                raise KeyError("view-topology checkpoint is missing view_scaling_mlp")
+            self.mlp_view_scaling.load_state_dict(checkpoint['view_scaling_mlp'])
 
     def contract_to_unisphere(self,
         x: torch.Tensor,
@@ -1142,9 +1303,23 @@ class GaussianModel(nn.Module):
         _mask = self.get_mask[mask_anchor]
         hash_embeddings = self.get_encoding_params()
 
+        topology_features = None
+        if self.use_view_topology:
+            estimate_order = calculate_morton_order(torch.round(_anchor / self.voxel_size))
+            _anchor = _anchor[estimate_order]
+            _feat = _feat[estimate_order]
+            _grid_offsets = _grid_offsets[estimate_order]
+            _scaling = _scaling[estimate_order]
+            _mask = _mask[estimate_order]
+            topology_features, _ = self.codec_view_topology(_anchor)
+
         feat_context = self.calc_interp_feat(_anchor)  # [N_visible_anchor*0.2, 32]
         mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
             torch.split(self.get_grid_mlp(feat_context), split_size_or_sections=[self.feat_dim, self.feat_dim, self.feat_dim, 6, 6, 3*self.n_offsets, 3*self.n_offsets, 1, 1, 1], dim=-1)  # [N_visible_anchor, 32], [N_visible_anchor, 32]
+        if self.use_view_topology:
+            mean_scaling, scale_scaling = self.apply_view_scaling_context(
+                mean_scaling, scale_scaling, topology_features,
+            )
         Q_feat = Q_feat * (1 + torch.tanh(Q_feat_adj))
         Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
         Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
@@ -1234,6 +1409,23 @@ class GaussianModel(nn.Module):
         _scaling = _scaling[sorted_indices]
         _mask = _mask[sorted_indices]
 
+        topology_features = None
+        if self.use_view_topology:
+            topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
+            torch.save({
+                'version': 1,
+                'feat_dim': self.feat_dim,
+                'n_offsets': self.n_offsets,
+                'view_topology_k': self.view_topology_k,
+                'view_topology_candidates': self.view_topology_candidates,
+                'grid_mlp': self.mlp_grid.state_dict(),
+                'deform_mlp': self.mlp_deform.state_dict(),
+                'view_scaling_mlp': self.mlp_view_scaling.state_dict(),
+                'camera_geometry': camera_geometry_state(self._view_topology_cameras),
+                'topology_feature_checksum': topology_diagnostics['feature_checksum'],
+                'topology_diagnostics': topology_diagnostics,
+            }, os.path.join(pre_path_name, 'entropy_context.pth'))
+
         torch.save(self.x_bound_min, os.path.join(pre_path_name, 'x_bound_min.pkl'))
         torch.save(self.x_bound_max, os.path.join(pre_path_name, 'x_bound_max.pkl'))
 
@@ -1265,6 +1457,13 @@ class GaussianModel(nn.Module):
             # many [N_num, ?]
             mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
                 torch.split(self.get_grid_mlp(feat_context), split_size_or_sections=[self.feat_dim, self.feat_dim, self.feat_dim, 6, 6, 3 * self.n_offsets, 3 * self.n_offsets, 1, 1, 1], dim=-1)
+
+            if self.use_view_topology:
+                mean_scaling, scale_scaling = self.apply_view_scaling_context(
+                    mean_scaling,
+                    scale_scaling,
+                    topology_features[N_start:N_end],
+                )
 
             Q_feat_adj = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
             Q_scaling_adj = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1]).view(-1)
@@ -1392,6 +1591,29 @@ class GaussianModel(nn.Module):
         self.x_bound_min = torch.load(os.path.join(pre_path_name, 'x_bound_min.pkl'))
         self.x_bound_max = torch.load(os.path.join(pre_path_name, 'x_bound_max.pkl'))
 
+        entropy_context = None
+        if self.use_view_topology:
+            entropy_context = torch.load(os.path.join(pre_path_name, 'entropy_context.pth'))
+            expected_config = {
+                'version': 1,
+                'feat_dim': self.feat_dim,
+                'n_offsets': self.n_offsets,
+                'view_topology_k': self.view_topology_k,
+                'view_topology_candidates': self.view_topology_candidates,
+            }
+            for key, expected in expected_config.items():
+                if entropy_context.get(key) != expected:
+                    raise RuntimeError(
+                        f"entropy context {key} mismatch: "
+                        f"{entropy_context.get(key)!r} != {expected!r}"
+                    )
+            self.mlp_grid.load_state_dict(entropy_context['grid_mlp'])
+            self.mlp_deform.load_state_dict(entropy_context['deform_mlp'])
+            self.mlp_view_scaling.load_state_dict(entropy_context['view_scaling_mlp'])
+            self._view_topology_cameras = camera_geometry_from_state(
+                entropy_context['camera_geometry']
+            )
+
         xyz_decoded_list = []
         feat_decoded_list = []
         scaling_decoded_list = []
@@ -1424,7 +1646,22 @@ class GaussianModel(nn.Module):
             hash_embeddings = decoder(N_hash, hash_b_name)  # {0, 1}
             hash_embeddings = (hash_embeddings * 2 - 1).to(torch.float32)
             hash_embeddings = hash_embeddings.view(-1, self.n_features_per_level)
+            # Attribute parameters must be derived from the decoded hash, not
+            # from whichever training-state hash happens to reside in memory.
+            self._install_hash_embeddings(hash_embeddings)
         t_hash += get_time() - t_hash_0
+
+        topology_features = None
+        if self.use_view_topology:
+            topology_features, topology_diagnostics = self.codec_view_topology(
+                anchor_decoded, force_rebuild=True,
+            )
+            expected_checksum = entropy_context['topology_feature_checksum']
+            if topology_diagnostics['feature_checksum'] != expected_checksum:
+                raise RuntimeError(
+                    "encoder/decoder view-topology feature checksum mismatch: "
+                    f"{topology_diagnostics['feature_checksum']} != {expected_checksum}"
+                )
 
         for s in range(steps):
 
@@ -1446,6 +1683,13 @@ class GaussianModel(nn.Module):
             # many [N_num, ?]
             mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
                 torch.split(self.get_grid_mlp(feat_context), split_size_or_sections=[self.feat_dim, self.feat_dim, self.feat_dim, 6, 6, 3 * self.n_offsets, 3 * self.n_offsets, 1, 1, 1], dim=-1)
+
+            if self.use_view_topology:
+                mean_scaling, scale_scaling = self.apply_view_scaling_context(
+                    mean_scaling,
+                    scale_scaling,
+                    topology_features[N_start:N_end],
+                )
 
             Q_feat_adj = Q_feat_adj.contiguous().repeat(1, mean.shape[-1])
             Q_scaling_adj = Q_scaling_adj.contiguous().repeat(1, mean_scaling.shape[-1]).view(-1)
@@ -1531,17 +1775,6 @@ class GaussianModel(nn.Module):
         self._anchor = nn.Parameter(_anchor)
         self._scaling = nn.Parameter(_scaling)
         self._mask = nn.Parameter(_mask)
-
-        if self.ste_binary:
-            if self.use_2D:
-                len_3D = self.encoding_xyz.encoding_xyz.params.shape[0]
-                len_2D = self.encoding_xyz.encoding_xy.params.shape[0]
-                self.encoding_xyz.encoding_xyz.params = nn.Parameter(hash_embeddings[0:len_3D])
-                self.encoding_xyz.encoding_xy.params = nn.Parameter(hash_embeddings[len_3D:len_3D+len_2D])
-                self.encoding_xyz.encoding_xz.params = nn.Parameter(hash_embeddings[len_3D+len_2D:len_3D+len_2D*2])
-                self.encoding_xyz.encoding_yz.params = nn.Parameter(hash_embeddings[len_3D+len_2D*2:len_3D+len_2D*3])
-            else:
-                self.encoding_xyz.params = nn.Parameter(hash_embeddings)
 
         print('Parameters are successfully replaced by decoded ones!')
 

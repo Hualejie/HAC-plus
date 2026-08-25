@@ -55,6 +55,9 @@ class ModelParams(ParamGroup):
         self.update_hierachy_factor = 4
 
         self.use_feat_bank = False
+        self.use_view_topology = False
+        self.view_topology_k = 8
+        self.view_topology_candidates = 16
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
@@ -134,6 +137,11 @@ class OptimizationParams(ParamGroup):
         self.mlp_deform_lr_final = 0.0005
         self.mlp_deform_lr_delay_mult = 0.01
         self.mlp_deform_lr_max_steps = 30_000
+
+        self.mlp_view_scaling_lr_init = 0.001
+        self.mlp_view_scaling_lr_final = 0.00001
+        self.mlp_view_scaling_lr_delay_mult = 0.01
+        self.mlp_view_scaling_lr_max_steps = 30_000
 
         self.mlp_hyp_lr_init = 0.005
         self.mlp_hyp_lr_final = 0.0005

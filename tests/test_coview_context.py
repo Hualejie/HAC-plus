@@ -7,9 +7,13 @@ from scene.coview_context import (
     ObservationRelation,
     build_geometric_observation_descriptors,
     build_geometry_observations,
+    build_view_topology_context,
+    camera_geometry_from_state,
+    camera_geometry_state,
     canonicalize_codec_anchors,
     coview_topk,
     pair_geometric_view_scores,
+    pair_distance_depth_scores,
     spatial_topk,
     spatial_topk_queries,
 )
@@ -154,3 +158,50 @@ def test_geometric_view_score_resolves_saturated_binary_jaccard():
     assert scores["geometric_image"][0] > scores["geometric_image"][1]
     assert scores["geometric_composite"][0] > scores["geometric_composite"][1]
     np.testing.assert_array_equal(scores["common_camera_count"], [2.0, 2.0])
+
+
+def test_view_topology_is_camera_permutation_invariant_and_quantized():
+    xyz = torch.tensor([
+        [-0.8, 0.0, 0.5],
+        [-0.2, 0.0, 0.5],
+        [0.1, 0.0, 0.5],
+        [0.7, 0.0, 0.5],
+    ])
+    cameras = [_camera("b", 1), _camera("a", 0)]
+    first = build_view_topology_context(
+        xyz, cameras, candidate_k=3, topk=2, feature_quantization=1e-4,
+    )
+    second = build_view_topology_context(
+        xyz, list(reversed(cameras)), candidate_k=3, topk=2, feature_quantization=1e-4,
+    )
+
+    np.testing.assert_array_equal(first.neighbors, second.neighbors)
+    np.testing.assert_array_equal(first.features, second.features)
+    np.testing.assert_allclose(first.features / 1e-4, np.round(first.features / 1e-4), atol=1e-3)
+    assert first.features.shape == (4, 15)
+    assert first.diagnostics["dense_anchor_pair_matrix_created"] is False
+
+
+def test_view_topology_camera_package_round_trip():
+    cameras = [_camera("b", 1), _camera("a", 0)]
+    state = camera_geometry_state(cameras)
+    restored = camera_geometry_from_state(state)
+
+    assert [camera.image_name for camera in restored] == ["a", "b"]
+    for before, after in zip(sorted(cameras, key=lambda camera: camera.image_name), restored):
+        torch.testing.assert_close(before.full_proj_transform, after.full_proj_transform)
+        torch.testing.assert_close(before.world_view_transform, after.world_view_transform)
+
+
+def test_distance_depth_fast_path_matches_full_geometric_scores():
+    xyz = torch.tensor([[0.0, 0.0, 0.5], [0.1, 0.0, 0.5], [0.8, 0.0, 0.5]])
+    cameras = [_camera("a", 0), _camera("b", 1)]
+    descriptors = build_geometric_observation_descriptors(xyz, cameras)
+    source = np.asarray([0, 0, 1])
+    target = np.asarray([1, 2, 2])
+
+    full = pair_geometric_view_scores(descriptors, source, target, batch_size=2)
+    fast = pair_distance_depth_scores(descriptors, source, target, batch_size=2)
+    np.testing.assert_allclose(fast["geometric_distance"], full["geometric_distance"])
+    np.testing.assert_allclose(fast["geometric_depth"], full["geometric_depth"])
+    np.testing.assert_array_equal(fast["common_camera_count"], full["common_camera_count"])
