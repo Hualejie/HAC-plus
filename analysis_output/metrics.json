@@ -1,0 +1,127 @@
+{
+  "scene": "playroom",
+  "model_path": "/home/fansonglin/data_space/Chenzhenxin/HAC-plus/outputs/blending/playroom/0.004",
+  "iteration": 30000,
+  "train_camera_count": 196,
+  "anchor_count_before_mask": 108549,
+  "valid_codec_anchor_count": 108549,
+  "voxel_size": 0.005,
+  "observation": {
+    "num_anchors": 108549,
+    "num_cameras": 196,
+    "num_edges": 2874437,
+    "num_unique_signatures": 11456,
+    "max_score_block_shape": [
+      256,
+      11456
+    ],
+    "dense_anchor_pair_matrix_created": false,
+    "unobserved_anchor_count": 1,
+    "mean_cameras_per_anchor": 26.480547955301294,
+    "max_cameras_per_anchor": 44
+  },
+  "k_results": {
+    "4": {
+      "mean_neighbor_overlap": 0.15265226364135742,
+      "median_neighbor_overlap": 0.0,
+      "mean_coview_score": 0.9958890676498413
+    },
+    "8": {
+      "mean_neighbor_overlap": 0.22999981045722961,
+      "median_neighbor_overlap": 0.125,
+      "mean_coview_score": 0.9933941960334778
+    },
+    "16": {
+      "mean_neighbor_overlap": 0.32377660274505615,
+      "median_neighbor_overlap": 0.3125,
+      "mean_coview_score": 0.988972008228302
+    },
+    "32": {
+      "mean_neighbor_overlap": 0.42103996872901917,
+      "median_neighbor_overlap": 0.4375,
+      "mean_coview_score": 0.9815754890441895
+    }
+  },
+  "default_k": 8,
+  "coview_attribute_correlations": {
+    "feature_cosine": {
+      "count": 868392,
+      "pearson": -0.012187255546450615,
+      "spearman": -0.016579140770772674
+    },
+    "feature_l2": {
+      "count": 868392,
+      "pearson": 0.06383182108402252,
+      "spearman": 0.0786630229484908
+    },
+    "scaling_l2": {
+      "count": 868392,
+      "pearson": -0.31023237109184265,
+      "spearman": -0.19484419465873903
+    },
+    "offset_l2": {
+      "count": 868392,
+      "pearson": -0.08994221687316895,
+      "spearman": -0.05179788620532886
+    }
+  },
+  "neighbor_comparison": {
+    "coview": {
+      "feature_cosine": 0.34129345417022705,
+      "feature_l2": 10.415773391723633,
+      "scaling_l2": 0.16671155393123627,
+      "offset_l2": 10.305183410644531
+    },
+    "spatial": {
+      "feature_cosine": 0.4316759407520294,
+      "feature_l2": 9.705963134765625,
+      "scaling_l2": 0.1407237946987152,
+      "offset_l2": 10.181910514831543
+    },
+    "random": {
+      "feature_cosine": 0.08176837116479874,
+      "feature_l2": 12.713907241821289,
+      "scaling_l2": 0.2060784250497818,
+      "offset_l2": 10.580432891845703
+    }
+  },
+  "controlled_spatial_experiment": {
+    "sampled_anchor_count": 20000,
+    "pair_count": 1280000,
+    "matched_pair_count": 267208,
+    "distance_match_caliper": 0.005,
+    "valid_distance_bins": 10,
+    "trend": {
+      "feature_cosine": {
+        "supporting_bins": 0,
+        "valid_bins": 10,
+        "support_fraction": 0.0,
+        "mean_high_minus_low": -0.00508473813533783
+      },
+      "feature_l2": {
+        "supporting_bins": 1,
+        "valid_bins": 10,
+        "support_fraction": 0.1,
+        "mean_high_minus_low": 0.0628702163696289
+      },
+      "scaling_l2": {
+        "supporting_bins": 10,
+        "valid_bins": 10,
+        "support_fraction": 1.0,
+        "mean_high_minus_low": -0.002090369910001755
+      },
+      "offset_l2": {
+        "supporting_bins": 2,
+        "valid_bins": 10,
+        "support_fraction": 0.2,
+        "mean_high_minus_low": 0.040816974639892575
+      }
+    }
+  },
+  "phase2_recommendation": {
+    "recommend": false,
+    "rule": "mean overlap < 0.8 and feature trend supported in >=60% of valid controlled bins",
+    "note": "Descriptive Phase 1 gate only; no p-value or fixed correlation threshold is imposed."
+  },
+  "runtime_seconds": 18.09319043159485
+}

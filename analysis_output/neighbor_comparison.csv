@@ -1,0 +1,13 @@
+k,neighbor_type,metric,mean
+8,coview,feature_cosine,0.34129345417022705
+8,coview,feature_l2,10.415773391723633
+8,coview,scaling_l2,0.16671155393123627
+8,coview,offset_l2,10.305183410644531
+8,spatial,feature_cosine,0.4316759407520294
+8,spatial,feature_l2,9.705963134765625
+8,spatial,scaling_l2,0.1407237946987152
+8,spatial,offset_l2,10.181910514831543
+8,random,feature_cosine,0.08176837116479874
+8,random,feature_l2,12.713907241821289
+8,random,scaling_l2,0.2060784250497818
+8,random,offset_l2,10.580432891845703
