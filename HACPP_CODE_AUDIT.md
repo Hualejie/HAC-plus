@@ -13,7 +13,7 @@
 3. 最合适的 CoView 接入层是 `calc_interp_feat(anchor_xyz)` 之后、feature/scaling/offset 参数被消费之前的统一 entropy parameter predictor。Phase 2 应以单一 helper 同时覆盖训练 rate、final estimate、encoder 和 decoder；不要从 rendering visible mask 推导 rate context，也不要修改 `Channel_CTX_fea` 的 chunk 顺序。
 4. 当前名为 `calculate_morton_order()` 的函数并未计算真正的 Morton/Z-order code。它使用 `x @ base**[0,1,2]` 形成混合进制排序键。规范中所有“Morton order”应改称“当前 codec canonical sort（代码函数名仍为 `calculate_morton_order`）”，除非后续明确修改 baseline。
 5. 当前 codec 不是 standalone decoder：MLP 权重、模型配置和部分状态不在 `bitstreams/` 中；更关键的是 `conduct_decoding()` 虽先读出 hash bitstream，却在 attribute 全部解码后才把 decoded hash 写回 `encoding_xyz`。attribute 解码时实际依赖同一进程中仍驻留的训练态 MLP/hash module。
-6. Baseline 的静态控制流已确认是 `train -> estimate -> encode -> decode -> test -> save decoded model -> reload -> render -> evaluate`。但本机无法完成动态 baseline：仓库没有数据和已有输出，目标环境没有可用 PyTorch，CUDA 扩展未安装，`tmc3` 不在 PATH，官方 run shell 还是 Linux shell 语法。故本审计不报告虚构的 size/fidelity/time 数值。
+6. Baseline 的静态控制流已确认是 `train -> estimate -> encode -> decode -> test -> save decoded model -> reload -> render -> evaluate`。本地 Windows 环境不具备运行条件；随后在用户提供的 Ubuntu/RTX 5090 服务器上完成了 Deep Blending `playroom` 的官方 30k 全流程，真实 encode/decode 与最终 PNG fidelity evaluation 均成功，指标见 5.2–5.4。
 
 ## 2. 关键对象与真实数据流
 
@@ -257,39 +257,58 @@ decoder 的文件读取调度是 anchor -> mask -> hash -> per-batch feature/sca
 
 ### 5.2 动态执行状态
 
-结论：**本机未能启动 baseline，因此没有有效实验指标。** 这是环境阻塞，不是 baseline 成功或失败结论。
+结论：**远端 baseline 全流程成功。** 未出现 traceback、CUDA OOM、NaN、GPCC 或 arithmetic coder 错误。
 
-| 检查项 | 当前状态 | 证据/影响 |
-|---|---|---|
-| 数据集 | 缺失 | 仓库无 `data/`；在 `E:\3DGS\4.2MEGS` 范围也未找到 `transforms_train.json`。 |
-| 已训练输出 | 缺失 | 仓库无 `outputs/`，`results/` 没有可用日志或指标。 |
-| Python/PyTorch | 不可用 | base Python 3.11.14 无 `torch`；`c3dgs` conda env 没有可执行 Python。`conda run -n base python train.py --help` 在 import torch 处失败。 |
-| CUDA | 仅驱动/toolkit 可见 | GTX 1660 Ti 6GB；driver 577.00；driver 显示 CUDA 12.9；本机 toolkit 12.1。仓库环境要求 Python 3.7/PyTorch 1.12.1/CUDA 11.6，README 声称 Ubuntu 20.04/CUDA 11.8。 |
-| CUDA extensions | 未安装 | submodules 仍是 zip；`diff-gaussian-rasterization`、`simple-knn`、`gridencoder`、`arithmetic` 无可 import 的当前环境构建。 |
-| GPCC | 缺失 | `tmc3` 不在 PATH，在本项目父目录范围也未发现 `tmc3.exe`；真实 encode/decode 必然失败。 |
-| run shell 跨平台 | 当前 Windows 不可直接运行 | 脚本命令以 `CUDA_VISIBLE_DEVICES=0 python ...` 开头，`cmd.exe` 报该命令不存在；README 明确只报告 Ubuntu 测试环境。 |
-| GPU 容量 | 风险 | 6GB 显存是否能跑官方 30k 配置未验证，尤其是 Mip-NeRF360；应先用一个 synthetic 小场景做 smoke/baseline。 |
+| 检查项 | 实测状态 |
+|---|---|
+| 服务器 | Ubuntu 22.04.5 LTS；2 × NVIDIA GeForce RTX 5090 32GB；本次使用 GPU 0 |
+| Python/PyTorch | Python 3.10.20；PyTorch 2.7.1+cu128；CUDA available |
+| CUDA extensions | `diff_gaussian_rasterization`、`simple_knn`、`_gridencoder`、`arithmetic`、`torch_scatter` 全部 import 成功 |
+| GPCC | `/home/fansonglin/data_space/Chenzhenxin/mpeg-pcc-tmc13/build/tmc3/tmc3`；三点 lossless round-trip smoke test 通过 |
+| 仓库 | `/home/fansonglin/data_space/Chenzhenxin/HAC-plus`；branch `codex/coview-context-audit-baseline` |
+| 数据 | `/home/fansonglin/xieliang/Chenzhenxin/dataset/tandt_db/db/playroom`；225 张原始 images；eval test set 29 views |
+| 输出 | `/home/fansonglin/data_space/Chenzhenxin/HAC-plus/outputs/blending/playroom/0.004` |
+
+运行参数严格对应官方 `run_shell_db.py` 的 `playroom` 配置：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python train.py \
+  -s /home/fansonglin/xieliang/Chenzhenxin/dataset/tandt_db/db/playroom \
+  --eval --lod 0 --voxel_size 0.005 --update_init_factor 16 \
+  --iterations 30000 \
+  -m /home/fansonglin/data_space/Chenzhenxin/HAC-plus/outputs/blending/playroom/0.004 \
+  --lmbda 0.004 --mask_lr_final 0.00032
+```
+
+训练初始化 35,155 anchors，训练结束 current anchor 数为 175,883；最终 `get_mask_anchor` 后真实编码 108,549 anchors。训练主体在进入 10k entropy-rate 阶段前约 45–52 it/s，之后约 29–30 it/s。
 
 ### 5.3 Baseline 指标记录
 
-| 指标 | 当前记录 |
+| 指标 | `playroom`, lambda=0.004 |
 |---|---:|
-| Encoded total MB | N/A（未执行） |
-| anchor MB | N/A（未执行） |
-| feature MB | N/A（未执行） |
-| scaling MB | N/A（未执行） |
-| offset MB | N/A（未执行） |
-| hash MB | N/A（未执行） |
-| mask MB | N/A（未执行） |
-| analytical MLP MB | N/A（未执行） |
-| PSNR | N/A（未执行） |
-| SSIM | N/A（未执行） |
-| LPIPS | N/A（未执行） |
-| training time | N/A（未执行） |
-| encoding time | N/A（未执行） |
-| decoding time | N/A（未执行） |
+| Estimated total MB | 2.8903 |
+| Encoded total MB（官方 log 口径） | 2.4405 |
+| anchor MB | 0.1674 |
+| feature MB | 0.8038 |
+| scaling MB | 0.5038 |
+| offset MB | 0.5091 |
+| hash MB | 0.0223 |
+| mask MB | 0.1036 |
+| analytical MLP MB | 0.3305 |
+| 最终 PNG PSNR | 30.6039162 |
+| 最终 PNG SSIM | 0.9080154 |
+| 最终 PNG LPIPS | 0.2696843 |
+| decoded tensor 即时 PSNR | 30.8020294 |
+| decoded tensor 即时 SSIM | 0.9088290 |
+| decoded tensor 即时 LPIPS | 0.2745670 |
+| training time | 882.5955 s |
+| encoding time | 1.8851 s |
+| decoding time | 3.8535 s |
+| post-reload test FPS | 492.6241 |
 
-完成动态 baseline 前至少需要：准备一个官方数据场景、建立与 CUDA/toolchain 兼容的 `HAC_env`、解压并编译四个 CUDA submodules、安装并加入 `tmc3` PATH，以及把 run script 改为 PowerShell/跨平台启动方式或在 WSL/Linux 上运行。环境具备后应保存完整 `outputs.log`、`results.json`、`bitstreams/` 的逐文件物理大小和峰值显存。
+官方 log 的 codec 分项时间为：anchor 0.1152 s、feature 0.9897 s、scaling 0.3974 s、offset 0.3337 s、hash 0.0058 s、mask 0.0080 s；decoder 分项为 anchor 0.0451 s、feature 1.9538 s、scaling 1.1690 s、offset 0.6315 s、hash 0.0085 s、mask 0.0156 s。
+
+最终 PNG 指标来自 `results.json`，是论文比较应采用的最终口径。`training_report()` 在内存 decoded tensors 上立即评估的数值略有差异；后处理会保存 render PNG，再读回 PNG 计算 `results.json`，因此不能混用两套 fidelity 数字。
 
 ### 5.4 报告 size 时必须区分的三种口径
 
@@ -298,6 +317,8 @@ decoder 的文件读取调度是 anchor -> mask -> hash -> per-batch feature/sca
 3. 实际交付 footprint：`bitstreams/` 全目录 + decoder 所需 checkpoint/config/metadata 的真实文件大小。
 
 当前 `Encoded Total` 不是第 3 种口径：它没有按物理大小统计两个 `x_bound_*.pkl`，MLP 也不在 bitstreams 中；相反它额外加了注释所称的 24-byte xyz bounds。后续论文表格应明确口径，并优先同时报告真实目录大小。
+
+本次实测进一步确认：`bitstreams/` 内所有文件内容总和是 2,215,704 bytes（2.113060 MiB），其中还包含两个共 3,210 bytes 的 `x_bound_*.pkl`；`du -sb` 含目录项为 2,227,992 bytes。加 analytical MLP 0.3305 MiB 后约 2.4436 MiB，与官方 reported Total 2.4405 MiB 的小差异来自 bounds/header 统计口径。真正 fresh-process standalone footprint 还必须考虑 7,426,677-byte `checkpoint.pth`、结构配置和 camera/context metadata，不能把 2.4405 MB 直接称为可独立解码包大小。
 
 ## 6. CoView Context 最合适的实际接入点
 
@@ -402,7 +423,7 @@ Phase 1 原则上无需修改 `gaussian_renderer`、`mlp_grid`、`Channel_CTX_fe
 
 ## 10. 本阶段边界与停止点
 
-本阶段只新增本审计文档，并执行了只读代码/环境检查与 Python syntax compile。未实现 `mlp_coview`、未新增 CoView module、未修改 renderer/model/codec/参数结构，也未声称 baseline 指标已测得。
+本阶段只新增并更新本审计文档，执行了代码/环境审计、GPCC smoke test，以及远端 `playroom` 官方 30k baseline 的 train -> encode -> decode -> test 全流程。未实现 `mlp_coview`、未新增 CoView module、未修改 renderer/model/codec/参数结构。
 
 进入 Phase 1 前建议先由用户确认：
 
