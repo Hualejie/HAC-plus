@@ -82,12 +82,13 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
                 torch.split(feat_context, split_size_or_sections=[pc.feat_dim, pc.feat_dim, pc.feat_dim, 6, 6, 3*pc.n_offsets, 3*pc.n_offsets, 1, 1, 1], dim=-1)
 
-            if pc.use_view_topology and pc.has_training_view_topology:
-                mean_scaling, scale_scaling = pc.apply_view_scaling_context(
-                    mean_scaling,
-                    scale_scaling,
-                    pc.training_view_topology(choose_idx),
-                )
+            if pc.coview_enabled and pc.has_training_view_topology:
+                topology_features = pc.training_view_topology(choose_idx)
+                mean, scale, mean_scaling, scale_scaling, mean_offsets, scale_offsets = \
+                    pc.apply_coview_entropy_parameters(
+                        mean, scale, mean_scaling, scale_scaling,
+                        mean_offsets, scale_offsets, topology_features,
+                    )
 
             Q_feat = 1
             Q_scaling = 0.001

@@ -36,6 +36,12 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.encodings import get_binary_vxl_size
+from utils.training_checkpoint import (
+    TRAINING_RUN_CHECKPOINT_VERSION,
+    capture_training_run,
+    restore_rng_state,
+    restore_viewpoint_stack,
+)
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
@@ -93,6 +99,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         use_view_topology=dataset.use_view_topology,
         view_topology_k=dataset.view_topology_k,
         view_topology_candidates=dataset.view_topology_candidates,
+        coview_target=dataset.coview_target,
         n_features_per_level=args_param.n_features,
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
@@ -102,14 +109,25 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
     gaussians.update_anchor_bound()
 
     gaussians.training_setup(opt)
+    viewpoint_stack = None
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        run_state = torch.load(checkpoint, weights_only=False)
+        if not isinstance(run_state, dict) or run_state.get("version") != TRAINING_RUN_CHECKPOINT_VERSION:
+            raise RuntimeError(
+                "start_checkpoint must be a versioned Phase 2B training checkpoint"
+            )
+        first_iter = run_state["iteration"]
+        gaussians.restore_training_checkpoint(run_state["model"], opt)
+        viewpoint_stack = restore_viewpoint_stack(
+            scene.getTrainCameras(), run_state["viewpoint_stack"]
+        )
+        # Restore stochastic state last: model construction, Scene shuffling and
+        # optimizer construction above are intentionally excluded from resume.
+        restore_rng_state(run_state["rng"])
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -138,7 +156,7 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         gaussians.update_learning_rate(iteration)
 
         if (
-            gaussians.use_view_topology
+            gaussians.coview_enabled
             and iteration > opt.update_until
             and not gaussians.has_training_view_topology
         ):
@@ -233,12 +251,19 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
                 del gaussians.offset_denom
                 torch.cuda.empty_cache()
 
-            if iteration < opt.iterations:
+            # A checkpoint at the terminal iteration is a continuation point,
+            # so it must include that iteration's optimizer update.
+            if iteration < opt.iterations or iteration in checkpoint_iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save(
+                    capture_training_run(
+                        gaussians, iteration, viewpoint_stack, vars(args_param)
+                    ),
+                    scene.model_path + "/chkpnt" + str(iteration) + ".pth",
+                )
 
     torch.cuda.synchronize(); t_end = time.time()
     logger.info("\n Total Training time: {}".format(t_end-t_start-log_time_sub))
@@ -439,6 +464,7 @@ def render_sets(args_param, dataset : ModelParams, iteration : int, pipeline : P
             use_view_topology=dataset.use_view_topology,
             view_topology_k=dataset.view_topology_k,
             view_topology_candidates=dataset.view_topology_candidates,
+            coview_target=dataset.coview_target,
             n_features_per_level=args_param.n_features,
             log2_hashmap_size=args_param.log2,
             log2_hashmap_size_2D=args_param.log2_2D,
@@ -591,6 +617,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--stop_after_checkpoint", action="store_true", default=False)
     parser.add_argument("--gpu", type=str, default = '-1')
     parser.add_argument("--log2", type=int, default = 13)
     parser.add_argument("--log2_2D", type=int, default = 15)
@@ -647,6 +674,14 @@ if __name__ == "__main__":
 
     # training
     x_bound_min, x_bound_max = training(args, lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
+    if args.stop_after_checkpoint:
+        if args.iterations not in args.checkpoint_iterations:
+            raise RuntimeError(
+                "--stop_after_checkpoint requires the terminal iteration in "
+                "--checkpoint_iterations"
+            )
+        logger.info("\nStopped after writing the requested shared checkpoint.")
+        sys.exit(0)
     if args.warmup:
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
