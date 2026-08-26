@@ -35,6 +35,9 @@ def main():
         required=True,
     )
     parser.add_argument("--feat_dim", type=int, default=50)
+    parser.add_argument(
+        "--coview_feature_mode", choices=("full", "chunk"), default="full"
+    )
     parser.add_argument("--n_offsets", type=int, default=10)
     parser.add_argument("--voxel_size", type=float, default=0.005)
     parser.add_argument("--view_topology_k", type=int, default=8)
@@ -52,6 +55,7 @@ def main():
         view_topology_k=args.view_topology_k,
         view_topology_candidates=args.view_topology_candidates,
         coview_target=args.coview_target,
+        coview_feature_mode=args.coview_feature_mode,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,

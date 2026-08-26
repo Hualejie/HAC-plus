@@ -17,16 +17,17 @@ from utils.training_checkpoint import (
 ATTRIBUTE_DIMS = {"feature": 50, "scaling": 6, "offset": 30}
 
 
-def _context_model(target):
+def _context_model(target, feature_mode="full"):
     model = GaussianModel.__new__(GaussianModel)
     nn.Module.__init__(model)
     model.use_view_topology = True
     model.coview_target = target
+    model.coview_feature_mode = feature_mode
     model._coview_residual_stats = {}
     model._coview_residual_accumulators = {}
     model._collect_coview_statistics = True
     model.mlp_coview_shared = nn.Sequential(nn.Linear(15, 4), nn.ReLU())
-    model.mlp_coview_feature = nn.Linear(4, 100)
+    model.mlp_coview_feature = nn.Linear(4, 100 if feature_mode == "full" else 10)
     model.mlp_coview_scaling = nn.Linear(4, 12)
     model.mlp_coview_offset = nn.Linear(4, 60)
     model.coview_gates = nn.ParameterDict({
@@ -84,6 +85,22 @@ def test_all_target_changes_every_attribute_and_records_gates():
     assert all(stats["gate"] == 1.0 for stats in model._coview_residual_stats.values())
 
 
+def test_chunk_feature_head_shares_one_residual_per_ten_channels():
+    model = _context_model("feature", feature_mode="chunk")
+    mean, scale = model.apply_coview_entropy_context(
+        torch.zeros(3, 50), torch.ones(3, 50), torch.ones(3, 15), "feature"
+    )
+    for chunk in range(5):
+        chunk_mean = mean[:, chunk * 10:(chunk + 1) * 10]
+        chunk_scale = scale[:, chunk * 10:(chunk + 1) * 10]
+        torch.testing.assert_close(
+            chunk_mean, chunk_mean[:, :1].expand_as(chunk_mean), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            chunk_scale, chunk_scale[:, :1].expand_as(chunk_scale), rtol=0, atol=0
+        )
+
+
 def test_entropy_parameter_prediction_is_state_dict_deterministic():
     encoder = _context_model("all")
     decoder = _context_model("all")
@@ -117,6 +134,7 @@ def _checkpoint_model():
     model.use_feat_bank = False
     model.view_topology_k = 8
     model.view_topology_candidates = 16
+    model.coview_feature_mode = "full"
     for name in (
         "mlp_opacity", "mlp_cov", "mlp_color", "encoding_xyz",
         "mlp_grid", "mlp_deform",

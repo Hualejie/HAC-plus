@@ -37,6 +37,10 @@ from utils.encodings_cuda import \
     encoder, decoder, \
     encoder_gaussian_chunk, decoder_gaussian_chunk, encoder_gaussian_mixed_chunk, decoder_gaussian_mixed_chunk
 from utils.gpcc_utils import compress_gpcc, decompress_gpcc, calculate_morton_order
+from utils.coview_serialization import (
+    deserialize_named_tensors,
+    serialize_named_tensors,
+)
 from scene.coview_context import (
     VIEW_TOPOLOGY_FEATURE_DIM,
     build_view_topology_context,
@@ -48,6 +52,7 @@ from scene.coview_context import (
 bit2MB_scale = 8 * 1024 * 1024
 MAX_batch_size = 3000
 COVIEW_TARGETS = ("none", "feature", "scaling", "offset", "all")
+COVIEW_FEATURE_MODES = ("full", "chunk")
 TRAINING_CHECKPOINT_VERSION = 2
 
 def get_time():
@@ -268,6 +273,7 @@ class GaussianModel(nn.Module):
                  view_topology_k: int=8,
                  view_topology_candidates: int=16,
                  coview_target: str="none",
+                 coview_feature_mode: str="full",
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -305,6 +311,14 @@ class GaussianModel(nn.Module):
         if coview_target != "none" and not use_view_topology:
             raise ValueError("a non-none coview_target requires use_view_topology")
         self.coview_target = coview_target
+        if coview_feature_mode not in COVIEW_FEATURE_MODES:
+            raise ValueError(
+                f"coview_feature_mode must be one of {COVIEW_FEATURE_MODES}, "
+                f"got {coview_feature_mode!r}"
+            )
+        if coview_feature_mode == "chunk" and self.feat_dim % 10:
+            raise ValueError("chunk-level Feature CoView requires feat_dim divisible by 10")
+        self.coview_feature_mode = coview_feature_mode
         if self.use_view_topology and not 0 < self.view_topology_k <= self.view_topology_candidates:
             raise ValueError("require 0 < view_topology_k <= view_topology_candidates")
         self._view_topology_cameras = tuple()
@@ -422,7 +436,12 @@ class GaussianModel(nn.Module):
                 # Construct Scaling first so the Phase 2A 15->32->12 branch
                 # retains the same initialization trajectory.
                 self.mlp_coview_scaling = nn.Linear(32, 12).cuda()
-                self.mlp_coview_feature = nn.Linear(32, self.feat_dim * 2).cuda()
+                feature_output_dim = (
+                    self.feat_dim * 2
+                    if self.coview_feature_mode == "full"
+                    else (self.feat_dim // 10) * 2
+                )
+                self.mlp_coview_feature = nn.Linear(32, feature_output_dim).cuda()
                 self.mlp_coview_offset = nn.Linear(32, 3 * self.n_offsets * 2).cuda()
                 for head in (
                     self.mlp_coview_feature,
@@ -503,6 +522,42 @@ class GaussianModel(nn.Module):
     def get_mlp_size(self, digit=32):
         bits = self.get_mlp_size_breakdown(digit=digit)["total_bits"]
         return bits, bits / 8 / 1024 / 1024
+
+    def coview_serializable_state(self):
+        state = {}
+        for name, tensor in self.mlp_coview_shared.state_dict().items():
+            state[f"shared.{name}"] = tensor
+        for attribute in self.active_coview_attributes():
+            for name, tensor in getattr(self, f"mlp_coview_{attribute}").state_dict().items():
+                state[f"head.{attribute}.{name}"] = tensor
+            state[f"gate.{attribute}"] = self.coview_gates[attribute].detach()
+        return state
+
+    def install_coview_serializable_state(self, state):
+        expected = set(self.coview_serializable_state())
+        actual = set(state)
+        if actual != expected:
+            raise RuntimeError(
+                "serialized CoView state mismatch: "
+                f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+            )
+        shared_prefix = "shared."
+        device = next(self.mlp_coview_shared.parameters()).device
+        self.mlp_coview_shared.load_state_dict({
+            name[len(shared_prefix):]: tensor.to(device)
+            for name, tensor in state.items()
+            if name.startswith(shared_prefix)
+        })
+        for attribute in self.active_coview_attributes():
+            prefix = f"head.{attribute}."
+            getattr(self, f"mlp_coview_{attribute}").load_state_dict({
+                name[len(prefix):]: tensor.to(device)
+                for name, tensor in state.items()
+                if name.startswith(prefix)
+            })
+            self.coview_gates[attribute].data.copy_(
+                state[f"gate.{attribute}"].to(device)
+            )
 
     def configure_view_topology_cameras(self, cameras):
         if self.use_view_topology:
@@ -589,6 +644,9 @@ class GaussianModel(nn.Module):
         residual = getattr(self, f"mlp_coview_{attribute}")(context)
         residual = self.coview_gates[attribute] * residual
         mean_residual, log_scale_residual = torch.chunk(residual, 2, dim=-1)
+        if attribute == "feature" and self.coview_feature_mode == "chunk":
+            mean_residual = mean_residual.repeat_interleave(10, dim=-1)
+            log_scale_residual = log_scale_residual.repeat_interleave(10, dim=-1)
         mean = mean + mean_residual
         scale = torch.clamp(scale, min=1e-9) * torch.exp(
             torch.clamp(log_scale_residual, min=-5.0, max=5.0)
@@ -755,6 +813,7 @@ class GaussianModel(nn.Module):
                 "use_view_topology": self.use_view_topology,
                 "view_topology_k": self.view_topology_k,
                 "view_topology_candidates": self.view_topology_candidates,
+                "coview_feature_mode": self.coview_feature_mode,
             },
             "gaussian_parameters": {
                 name: {
@@ -792,12 +851,16 @@ class GaussianModel(nn.Module):
             "use_view_topology": self.use_view_topology,
             "view_topology_k": self.view_topology_k,
             "view_topology_candidates": self.view_topology_candidates,
+            "coview_feature_mode": self.coview_feature_mode,
         }
         for key, value in expected.items():
-            if architecture.get(key) != value:
+            saved_value = architecture.get(
+                key, "full" if key == "coview_feature_mode" else None
+            )
+            if saved_value != value:
                 raise RuntimeError(
                     f"training checkpoint {key} mismatch: "
-                    f"{architecture.get(key)!r} != {value!r}"
+                    f"{saved_value!r} != {value!r}"
                 )
 
         for name, saved in state["gaussian_parameters"].items():
@@ -1494,6 +1557,7 @@ class GaussianModel(nn.Module):
         if self.use_view_topology:
             checkpoint.update({
                 'coview_target': self.coview_target,
+                'coview_feature_mode': self.coview_feature_mode,
                 'coview_shared_mlp': self.mlp_coview_shared.state_dict(),
                 'coview_feature_head': self.mlp_coview_feature.state_dict(),
                 'coview_scaling_head': self.mlp_coview_scaling.state_dict(),
@@ -1503,7 +1567,7 @@ class GaussianModel(nn.Module):
         torch.save(checkpoint, path)
 
 
-    def load_mlp_checkpoints(self,path):
+    def load_mlp_checkpoints(self, path, load_coview_feature_head=True):
         checkpoint = torch.load(path)
         self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
         self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
@@ -1521,8 +1585,15 @@ class GaussianModel(nn.Module):
             missing = [key for key in required if key not in checkpoint]
             if missing:
                 raise KeyError(f"CoView checkpoint is missing {missing}")
+            checkpoint_feature_mode = checkpoint.get('coview_feature_mode', 'full')
+            if load_coview_feature_head and checkpoint_feature_mode != self.coview_feature_mode:
+                raise RuntimeError(
+                    "CoView Feature head mode mismatch: "
+                    f"{checkpoint_feature_mode!r} != {self.coview_feature_mode!r}"
+                )
             self.mlp_coview_shared.load_state_dict(checkpoint['coview_shared_mlp'])
-            self.mlp_coview_feature.load_state_dict(checkpoint['coview_feature_head'])
+            if load_coview_feature_head:
+                self.mlp_coview_feature.load_state_dict(checkpoint['coview_feature_head'])
             self.mlp_coview_scaling.load_state_dict(checkpoint['coview_scaling_head'])
             self.mlp_coview_offset.load_state_dict(checkpoint['coview_offset_head'])
             self.coview_gates.load_state_dict(checkpoint['coview_gates'])
@@ -1640,7 +1711,7 @@ class GaussianModel(nn.Module):
         return log_info
 
     @torch.no_grad()
-    def conduct_encoding(self, pre_path_name):
+    def conduct_encoding(self, pre_path_name, coview_serialization="fp32"):
 
         t_total = 0
         t_anchor = 0
@@ -1684,28 +1755,38 @@ class GaussianModel(nn.Module):
         _mask = _mask[sorted_indices]
 
         topology_features = None
+        coview_model_bits = 0
         entropy_context = {
             'version': 2,
             'feat_dim': self.feat_dim,
             'n_offsets': self.n_offsets,
             'coview_target': self.coview_target,
+            'coview_feature_mode': self.coview_feature_mode,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
             'grid_mlp': self.mlp_grid.state_dict(),
             'deform_mlp': self.mlp_deform.state_dict(),
         }
         if self.coview_enabled:
+            coview_model_path = os.path.join(pre_path_name, 'coview_model.bin')
+            coview_model_metadata = serialize_named_tensors(
+                self.coview_serializable_state(),
+                coview_model_path,
+                storage_format=coview_serialization,
+            )
+            serialized_state, decoded_metadata = deserialize_named_tensors(
+                coview_model_path
+            )
+            if decoded_metadata != coview_model_metadata:
+                raise RuntimeError("CoView serialization metadata changed during round trip")
+            # Encoding uses exactly the dequantized parameters that a fresh
+            # decoder reconstructs, including for FP16 and INT8 packages.
+            self.install_coview_serializable_state(serialized_state)
+            coview_model_bits = coview_model_metadata['bytes'] * 8
             topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
             entropy_context.update({
-                'coview_shared_mlp': self.mlp_coview_shared.state_dict(),
-                'coview_heads': {
-                    attribute: getattr(self, f'mlp_coview_{attribute}').state_dict()
-                    for attribute in self.active_coview_attributes()
-                },
-                'coview_gates': {
-                    attribute: self.coview_gates[attribute].detach()
-                    for attribute in self.active_coview_attributes()
-                },
+                'coview_model_file': 'coview_model.bin',
+                'coview_model_metadata': coview_model_metadata,
                 'camera_geometry': camera_geometry_state(self._view_topology_cameras),
                 'topology_feature_checksum': topology_diagnostics['feature_checksum'],
                 'topology_diagnostics': topology_diagnostics,
@@ -1841,6 +1922,7 @@ class GaussianModel(nn.Module):
 
         # 32*3*2/bit2MB_scale is for xyz_bound_min and xyz_bound_max
         mlp_sizes = self.get_mlp_size_breakdown()
+        total_mlp_bits = mlp_sizes['base_bits'] + coview_model_bits
         log_info = f"\nEncoded sizes in MB: " \
                    f"anchor {round(bit_anchor/bit2MB_scale, 4)}, " \
                    f"feat {round(bit_feat/bit2MB_scale, 4)}, " \
@@ -1849,9 +1931,9 @@ class GaussianModel(nn.Module):
                    f"hash {round(bit_hash/bit2MB_scale, 4)}, " \
                    f"masks {round(bit_masks/bit2MB_scale, 4)}, " \
                    f"base_MLPs {round(mlp_sizes['base_bits']/bit2MB_scale, 4)}, " \
-                   f"active_CoView_MLPs {round(mlp_sizes['active_coview_bits']/bit2MB_scale, 4)}, " \
-                   f"MLPs {round(mlp_sizes['total_bits']/bit2MB_scale, 4)}, " \
-                   f"Total {round((bit_anchor + bit_feat + bit_scaling + bit_offsets + bit_hash + bit_masks + mlp_sizes['total_bits'])/bit2MB_scale + 32*3*2/bit2MB_scale, 4)}, " \
+                   f"active_CoView_MLPs {round(coview_model_bits/bit2MB_scale, 4)}, " \
+                   f"MLPs {round(total_mlp_bits/bit2MB_scale, 4)}, " \
+                   f"Total {round((bit_anchor + bit_feat + bit_scaling + bit_offsets + bit_hash + bit_masks + total_mlp_bits)/bit2MB_scale + 32*3*2/bit2MB_scale, 4)}, " \
                    f"EncTime {round(t2 - t1, 4)}"
         log_info_time = f"\nEncoded time in s: " \
                    f"anchor {round(t_anchor, 4)}, " \
@@ -1893,26 +1975,45 @@ class GaussianModel(nn.Module):
             'feat_dim': self.feat_dim,
             'n_offsets': self.n_offsets,
             'coview_target': self.coview_target,
+            'coview_feature_mode': self.coview_feature_mode,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
         }
         for key, expected in expected_config.items():
-            if entropy_context.get(key) != expected:
+            saved_value = entropy_context.get(
+                key, "full" if key == "coview_feature_mode" else None
+            )
+            if saved_value != expected:
                 raise RuntimeError(
                     f"entropy context {key} mismatch: "
-                    f"{entropy_context.get(key)!r} != {expected!r}"
+                    f"{saved_value!r} != {expected!r}"
                 )
         self.mlp_grid.load_state_dict(entropy_context['grid_mlp'])
         self.mlp_deform.load_state_dict(entropy_context['deform_mlp'])
         if self.coview_enabled:
-            self.mlp_coview_shared.load_state_dict(entropy_context['coview_shared_mlp'])
-            for attribute in self.active_coview_attributes():
-                getattr(self, f'mlp_coview_{attribute}').load_state_dict(
-                    entropy_context['coview_heads'][attribute]
+            if 'coview_model_file' in entropy_context:
+                coview_model_path = os.path.join(
+                    pre_path_name, entropy_context['coview_model_file']
                 )
-                self.coview_gates[attribute].data.copy_(
-                    entropy_context['coview_gates'][attribute]
+                coview_state, coview_metadata = deserialize_named_tensors(
+                    coview_model_path
                 )
+                if coview_metadata != entropy_context['coview_model_metadata']:
+                    raise RuntimeError("CoView model blob metadata/checksum mismatch")
+                self.install_coview_serializable_state(coview_state)
+            else:
+                # Read Phase 2A/2B packages produced before the deterministic
+                # CoView blob became part of the codec contract.
+                self.mlp_coview_shared.load_state_dict(
+                    entropy_context['coview_shared_mlp']
+                )
+                for attribute in self.active_coview_attributes():
+                    getattr(self, f'mlp_coview_{attribute}').load_state_dict(
+                        entropy_context['coview_heads'][attribute]
+                    )
+                    self.coview_gates[attribute].data.copy_(
+                        entropy_context['coview_gates'][attribute]
+                    )
             self._view_topology_cameras = camera_geometry_from_state(
                 entropy_context['camera_geometry']
             )

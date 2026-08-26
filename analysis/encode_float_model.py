@@ -31,6 +31,9 @@ def main():
         help="entropy_context.pth from the trained ON stream; required for active CoView",
     )
     parser.add_argument("--feat_dim", type=int, default=50)
+    parser.add_argument(
+        "--coview_feature_mode", choices=("full", "chunk"), default="full"
+    )
     parser.add_argument("--n_offsets", type=int, default=10)
     parser.add_argument("--voxel_size", type=float, default=0.005)
     parser.add_argument("--view_topology_k", type=int, default=8)
@@ -38,6 +41,9 @@ def main():
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
+    parser.add_argument(
+        "--coview_serialization", choices=("fp32", "fp16", "int8"), default="fp32"
+    )
     args = parser.parse_args()
 
     float_path = Path(args.float_model).resolve()
@@ -51,6 +57,7 @@ def main():
         view_topology_k=args.view_topology_k,
         view_topology_candidates=args.view_topology_candidates,
         coview_target=args.coview_target,
+        coview_feature_mode=args.coview_feature_mode,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,
@@ -67,8 +74,14 @@ def main():
             context["camera_geometry"]
         )
     model.eval()
-    log = model.conduct_encoding(str(output_path))
-    print(json.dumps({"coview_target": args.coview_target, "encode_log": log}))
+    log = model.conduct_encoding(
+        str(output_path), coview_serialization=args.coview_serialization
+    )
+    print(json.dumps({
+        "coview_target": args.coview_target,
+        "coview_serialization": args.coview_serialization,
+        "encode_log": log,
+    }))
 
 
 if __name__ == "__main__":

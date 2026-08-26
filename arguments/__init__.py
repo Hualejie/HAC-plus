@@ -59,6 +59,7 @@ class ModelParams(ParamGroup):
         self.view_topology_k = 8
         self.view_topology_candidates = 16
         self.coview_target = "none"
+        self.coview_feature_mode = "full"
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
