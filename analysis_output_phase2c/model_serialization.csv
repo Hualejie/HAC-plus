@@ -1,0 +1,8 @@
+scene,target,architecture,serialization,model_bytes,attribute_stream_bytes,attribute_plus_model_bytes,net_bytes_saved,fresh_decode
+playroom,feature,32->100,fp32,15420,868112,883532,-2924,True
+playroom,feature,32->10,fp32,3540,876518,880058,550,True
+playroom,feature,32->10,fp16,1854,876517,878371,2237,True
+playroom,feature,32->10,int8,1031,876528,877559,3049,True
+playroom,scaling,15->32->12,fp32,3804,514134,517938,2777,True
+playroom,scaling,15->32->12,fp16,1986,514080,516066,4649,True
+playroom,scaling,15->32->12,int8,1097,654229,655326,-134611,True

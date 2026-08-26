@@ -73,6 +73,13 @@ def frozen_rows(root):
         for label, result in manifest["results"].items():
             if storage != "fp32" and label == "a1_base":
                 continue
+            fresh = last_json_line(path / label / "fresh_decode.json")
+            fresh_decode = bool(
+                fresh
+                and fresh.get("fresh_decode")
+                and fresh.get("symbol_index_checksum")
+                == result["symbol_index_checksum"]
+            )
             experiment, variant = label.split("_", 1)
             control = manifest["results"][f"{experiment}_base" if experiment == "a1" else "a2_control"]
             raw_saving = control["feature_stream_bytes"] - result["feature_stream_bytes"]
@@ -105,7 +112,7 @@ def frozen_rows(root):
                     "attribute_stream_bytes": result["feature_stream_bytes"],
                     "attribute_plus_model_bytes": result["feature_plus_model_bytes"],
                     "net_bytes_saved": net_saving,
-                    "fresh_decode": True,
+                    "fresh_decode": fresh_decode,
                 })
     return rows, ablation, serialization
 
