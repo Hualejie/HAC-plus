@@ -399,13 +399,16 @@ class GaussianModel(nn.Module):
             self.mlp_deform = Channel_CTX_fea_tiny().cuda()
 
         if self.use_view_topology:
-            self.mlp_view_scaling = nn.Sequential(
-                nn.Linear(VIEW_TOPOLOGY_FEATURE_DIM, 32),
-                nn.ReLU(True),
-                nn.Linear(32, 12),
-            ).cuda()
-            nn.init.zeros_(self.mlp_view_scaling[-1].weight)
-            nn.init.zeros_(self.mlp_view_scaling[-1].bias)
+            # Keep all baseline stochastic operations (renderer sampling and
+            # densification) on the same RNG trajectory for a paired ablation.
+            with torch.random.fork_rng(devices=[]):
+                self.mlp_view_scaling = nn.Sequential(
+                    nn.Linear(VIEW_TOPOLOGY_FEATURE_DIM, 32),
+                    nn.ReLU(True),
+                    nn.Linear(32, 12),
+                ).cuda()
+                nn.init.zeros_(self.mlp_view_scaling[-1].weight)
+                nn.init.zeros_(self.mlp_view_scaling[-1].bias)
 
         self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
         self.EG_mix_prob_2 = Entropy_gaussian_mix_prob_2(Q=1).cuda()
