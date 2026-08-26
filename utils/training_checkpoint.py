@@ -31,7 +31,19 @@ def restore_rng_state(state):
     if state["torch_cuda"]:
         if not torch.cuda.is_available():
             raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is unavailable")
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        visible_devices = torch.cuda.device_count()
+        if visible_devices == len(state["torch_cuda"]):
+            torch.cuda.set_rng_state_all(state["torch_cuda"])
+        elif visible_devices == 1:
+            # A branch may be isolated onto a different physical GPU with
+            # CUDA_VISIBLE_DEVICES.  It still runs as logical CUDA:0 and must
+            # inherit the shared run's logical CUDA:0 RNG trajectory.
+            torch.cuda.set_rng_state(state["torch_cuda"][0], device=0)
+        else:
+            raise RuntimeError(
+                "checkpoint CUDA RNG device-count mismatch: "
+                f"saved {len(state['torch_cuda'])}, visible {visible_devices}"
+            )
 
 
 def capture_training_run(gaussians, iteration, viewpoint_stack, config):

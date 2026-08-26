@@ -1,4 +1,5 @@
 from types import MethodType, SimpleNamespace
+import random
 
 import numpy as np
 import pytest
@@ -200,3 +201,22 @@ def test_rng_and_camera_stack_round_trip():
     saved_keys = [camera_checkpoint_key(cameras[2]), camera_checkpoint_key(cameras[0])]
     restored = restore_viewpoint_stack(list(reversed(cameras)), saved_keys)
     assert [camera.image_name for camera in restored] == ["c", "a"]
+
+
+def test_multi_gpu_checkpoint_rng_restores_into_isolated_logical_gpu(monkeypatch):
+    cuda_states = [torch.arange(8, dtype=torch.uint8), torch.arange(8, dtype=torch.uint8) + 1]
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": cuda_states,
+    }
+    restored = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state", lambda value, device: restored.append((value, device))
+    )
+    restore_rng_state(state)
+    assert restored[0][1] == 0
+    torch.testing.assert_close(restored[0][0], cuda_states[0], rtol=0, atol=0)
