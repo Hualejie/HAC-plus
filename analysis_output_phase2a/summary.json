@@ -1,0 +1,101 @@
+{
+  "scene": "Deep Blending playroom",
+  "iterations": 30000,
+  "lambda": 0.004,
+  "voxel_size": 0.005,
+  "view_topology": {
+    "candidate_k": 16,
+    "topk": 8,
+    "feature_dim": 15,
+    "feature_quantization": 1e-05,
+    "mlp_parameter_count": 908,
+    "mlp_tensor_bytes": 3632
+  },
+  "runs": {
+    "official_baseline": {
+      "valid_codec_anchors": 108549,
+      "training_seconds": 882.6,
+      "encoded_mib": {
+        "anchor": 0.1674,
+        "feature": 0.8038,
+        "scaling": 0.5038,
+        "offset": 0.5091,
+        "hash": 0.0223,
+        "mask": 0.1036,
+        "mlps": 0.3305,
+        "total": 2.4405
+      },
+      "quality": {
+        "psnr": 30.8020294453,
+        "ssim": 0.9088289553,
+        "lpips": 0.2745670132
+      },
+      "encode_seconds": 1.8851,
+      "decode_seconds": 3.8535
+    },
+    "same_code_control_repro": {
+      "valid_codec_anchors": 103218,
+      "training_seconds": 882.0,
+      "encoded_mib": {
+        "anchor": 0.1611,
+        "feature": 0.7778,
+        "scaling": 0.4737,
+        "offset": 0.5049,
+        "hash": 0.0314,
+        "mask": 0.1008,
+        "mlps": 0.3305,
+        "total": 2.3803
+      },
+      "quality": {
+        "psnr": 30.7861140021,
+        "ssim": 0.9090293954,
+        "lpips": 0.2744254999
+      },
+      "encode_seconds": 1.7995,
+      "decode_seconds": 3.7214
+    },
+    "view_topology": {
+      "valid_codec_anchors": 103128,
+      "training_seconds": 904.0,
+      "encoded_mib": {
+        "anchor": 0.1611,
+        "feature": 0.7804,
+        "scaling": 0.483,
+        "offset": 0.51,
+        "hash": 0.0231,
+        "mask": 0.1005,
+        "mlps": 0.334,
+        "total": 2.3921
+      },
+      "quality": {
+        "psnr": 30.8808062981,
+        "ssim": 0.9104824457,
+        "lpips": 0.2735090667
+      },
+      "encode_seconds": 1.8378,
+      "decode_seconds": 7.5314
+    }
+  },
+  "same_checkpoint_codec_ablation": {
+    "view_topology_scaling_bytes": 506453,
+    "topology_disabled_scaling_bytes": 592004,
+    "scaling_bytes_saved": 85551,
+    "scaling_relative_reduction": 0.1445108479,
+    "feature_bytes_identical": true,
+    "offset_bytes_identical": true,
+    "net_bytes_saved_after_new_mlp": 81919
+  },
+  "fresh_process_decode": {
+    "passed": true,
+    "feature_checksum": "b679a838a665cc1fdb2c5c5dd6d282652e35836c3734701f31859eed51064e0e",
+    "num_anchors": 103128,
+    "num_cameras": 196,
+    "observation_edges": 2737409,
+    "dense_anchor_pair_matrix_created": false,
+    "decode_seconds": 7.7467
+  },
+  "decision": {
+    "phase2b_go": false,
+    "reason": "The fixed-checkpoint codec ablation proves useful conditional information, but an independent same-code control produced a smaller Scaling stream and total model. The end-to-end gain is not yet reproducible."
+  }
+}
