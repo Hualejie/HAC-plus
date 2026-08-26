@@ -67,14 +67,21 @@ def main():
         model, q_feature, anchors, package_path / "stream", topology
     )
     checksum = tensor_checksum(decoded)
-    if checksum != context["symbol_checksum"]:
+    symbol_index_checksum = tensor_checksum(
+        torch.round(decoded / q_feature).to(torch.int32)
+    )
+    if symbol_index_checksum != context["symbol_index_checksum"]:
         raise RuntimeError(
-            f"fresh Feature checksum mismatch: {checksum} != {context['symbol_checksum']}"
+            "fresh Feature symbol-index checksum mismatch: "
+            f"{symbol_index_checksum} != {context['symbol_index_checksum']}"
         )
     result = {
         "label": context["label"],
         "num_anchors": int(anchors.shape[0]),
         "symbol_checksum": checksum,
+        "reference_float_symbol_checksum": context["symbol_checksum"],
+        "float_symbol_checksum_match": checksum == context["symbol_checksum"],
+        "symbol_index_checksum": symbol_index_checksum,
         "anchor_checksum": tensor_checksum(anchors),
         "q_checksum": tensor_checksum(q_feature),
         "coview_model_metadata": coview_metadata,

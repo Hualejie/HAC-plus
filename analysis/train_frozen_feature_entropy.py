@@ -98,6 +98,7 @@ def capture_fixed_representation(model):
     symbols = STE_multistep.apply(
         raw_features, q_feature, model._anchor_feat.mean()
     ).detach()
+    symbol_indices = torch.round(symbols / q_feature).to(torch.int32)
     return {
         "anchors": anchors.detach(),
         "symbols": symbols,
@@ -107,6 +108,7 @@ def capture_fixed_representation(model):
         "hash_checksum": tensor_checksum(model.get_encoding_params()),
         "anchor_checksum": tensor_checksum(anchors),
         "symbol_checksum": tensor_checksum(symbols),
+        "symbol_index_checksum": tensor_checksum(symbol_indices),
         "q_checksum": tensor_checksum(q_feature),
     }
 
@@ -245,6 +247,7 @@ def save_and_encode(label, model, fixed, topology, args, training_metrics):
         "topology_checksum": tensor_checksum(topology),
         "anchor_checksum": fixed["anchor_checksum"],
         "symbol_checksum": fixed["symbol_checksum"],
+        "symbol_index_checksum": fixed["symbol_index_checksum"],
         "q_checksum": fixed["q_checksum"],
         "coview_model_file": "coview_model.bin" if model.coview_enabled else None,
         "coview_model_metadata": coview_metadata,
@@ -263,6 +266,7 @@ def save_and_encode(label, model, fixed, topology, args, training_metrics):
             0 if coview_metadata is None else coview_metadata["bytes"]
         ),
         "symbol_checksum": fixed["symbol_checksum"],
+        "symbol_index_checksum": fixed["symbol_index_checksum"],
         "q_checksum": fixed["q_checksum"],
         **training_metrics,
     }
