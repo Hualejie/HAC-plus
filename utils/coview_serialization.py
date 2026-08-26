@@ -35,7 +35,8 @@ def serialize_named_tensors(named_tensors, path, storage_format="fp32"):
     """Serialize a mapping of floating tensors and return real blob metadata."""
     if storage_format not in FORMAT_CODES:
         raise ValueError(f"unsupported CoView serialization format {storage_format!r}")
-    ordered = OrderedDict(sorted(named_tensors.items()))
+    items = named_tensors.items() if hasattr(named_tensors, "items") else named_tensors
+    ordered = OrderedDict(sorted(items))
     blob = bytearray(MAGIC)
     blob.extend(struct.pack("<BI", FORMAT_CODES[storage_format], len(ordered)))
     for name, tensor in ordered.items():
