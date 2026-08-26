@@ -217,6 +217,6 @@ def test_delayed_learning_rate_uses_absolute_endpoint():
         step_sub=15_000,
     )
 
-    assert schedule(1) == 1e-3
-    assert schedule(15_000) == 1e-3
+    assert np.isclose(schedule(1), 1e-3)
+    assert np.isclose(schedule(15_000), 1e-3)
     assert np.isclose(schedule(30_000), 1e-5)
