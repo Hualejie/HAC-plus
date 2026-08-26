@@ -229,6 +229,17 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
 
             # Log and save
             torch.cuda.synchronize(); t_start_log = time.time()
+            if iteration == testing_iterations[-1]:
+                # conduct_decoding() intentionally replaces the in-memory
+                # attributes. Preserve the trained floating checkpoint first so
+                # same-checkpoint CoView ON/OFF diagnostics remain possible.
+                float_path = os.path.join(
+                    scene.model_path, "float_model", f"iteration_{iteration}"
+                )
+                gaussians.save_ply(os.path.join(float_path, "point_cloud.ply"))
+                gaussians.save_mlp_checkpoints(os.path.join(float_path, "checkpoint.pth"))
+                torch.save(gaussians.x_bound_min, os.path.join(float_path, "x_bound_min.pkl"))
+                torch.save(gaussians.x_bound_max, os.path.join(float_path, "x_bound_max.pkl"))
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, args_param.model_path)
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))

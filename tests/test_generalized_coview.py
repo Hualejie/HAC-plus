@@ -23,6 +23,8 @@ def _context_model(target):
     model.use_view_topology = True
     model.coview_target = target
     model._coview_residual_stats = {}
+    model._coview_residual_accumulators = {}
+    model._collect_coview_statistics = True
     model.mlp_coview_shared = nn.Sequential(nn.Linear(15, 4), nn.ReLU())
     model.mlp_coview_feature = nn.Linear(4, 100)
     model.mlp_coview_scaling = nn.Linear(4, 12)

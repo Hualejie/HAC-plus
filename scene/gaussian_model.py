@@ -312,6 +312,8 @@ class GaussianModel(nn.Module):
         self._training_view_topology_diagnostics = None
         self._codec_view_topology_cache = None
         self._coview_residual_stats = {}
+        self._coview_residual_accumulators = {}
+        self._collect_coview_statistics = False
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -591,14 +593,48 @@ class GaussianModel(nn.Module):
         scale = torch.clamp(scale, min=1e-9) * torch.exp(
             torch.clamp(log_scale_residual, min=-5.0, max=5.0)
         )
-        with torch.no_grad():
-            self._coview_residual_stats[attribute] = {
-                "gate": float(self.coview_gates[attribute].detach().cpu()),
-                "mean": float(residual.detach().mean().cpu()),
-                "std": float(residual.detach().std(unbiased=False).cpu()),
-                "mean_abs": float(residual.detach().abs().mean().cpu()),
-            }
+        if self._collect_coview_statistics:
+            with torch.no_grad():
+                values = residual.detach().to(torch.float64)
+                accumulator = self._coview_residual_accumulators.setdefault(
+                    attribute,
+                    {"count": 0, "sum": 0.0, "sum_sq": 0.0, "sum_abs": 0.0},
+                )
+                accumulator["count"] += values.numel()
+                accumulator["sum"] += float(values.sum().cpu())
+                accumulator["sum_sq"] += float((values * values).sum().cpu())
+                accumulator["sum_abs"] += float(values.abs().sum().cpu())
+                self._coview_residual_stats = self.coview_residual_statistics()
         return mean, scale
+
+    def reset_coview_residual_statistics(self):
+        self._coview_residual_accumulators = {}
+        self._coview_residual_stats = {}
+
+    def coview_gate_values(self):
+        if not self.use_view_topology:
+            return {}
+        return {
+            attribute: float(self.coview_gates[attribute].detach().cpu())
+            for attribute in ("feature", "scaling", "offset")
+        }
+
+    def coview_residual_statistics(self):
+        statistics = {}
+        for attribute, accumulator in self._coview_residual_accumulators.items():
+            count = accumulator["count"]
+            if not count:
+                continue
+            mean = accumulator["sum"] / count
+            variance = max(accumulator["sum_sq"] / count - mean * mean, 0.0)
+            statistics[attribute] = {
+                "gate": self.coview_gate_values()[attribute],
+                "mean": mean,
+                "std": variance ** 0.5,
+                "mean_abs": accumulator["sum_abs"] / count,
+                "count": count,
+            }
+        return statistics
 
     # Compatibility wrapper for Phase 2A callers/checkpoints during migration.
     def apply_view_scaling_context(self, mean_scaling, scale_scaling, topology_features):
@@ -1618,6 +1654,8 @@ class GaussianModel(nn.Module):
         t_total_0 = get_time()
         torch.cuda.synchronize(); t1 = time.time()
         print('Start encoding ...')
+        self.reset_coview_residual_statistics()
+        self._collect_coview_statistics = True
 
         mask_anchor = self.get_mask_anchor.to(torch.bool)[:, 0]  # N
 
@@ -1819,6 +1857,10 @@ class GaussianModel(nn.Module):
                    f"masks {round(t_mask, 4)}, " \
                    f"Total {round(t_total, 4)}"
         log_info = log_info + log_info_time
+        if self.use_view_topology:
+            log_info += f"\nCoView gates: {self.coview_gate_values()}"
+            log_info += f"\nCoView residual statistics: {self.coview_residual_statistics()}"
+        self._collect_coview_statistics = False
         return log_info
 
     @torch.no_grad()
