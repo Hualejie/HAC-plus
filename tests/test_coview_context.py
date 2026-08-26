@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from utils.general_utils import get_expon_lr_func
+
 from scene.coview_context import (
     ObservationRelation,
     build_geometric_observation_descriptors,
@@ -205,3 +207,16 @@ def test_distance_depth_fast_path_matches_full_geometric_scores():
     np.testing.assert_allclose(fast["geometric_distance"], full["geometric_distance"])
     np.testing.assert_allclose(fast["geometric_depth"], full["geometric_depth"])
     np.testing.assert_array_equal(fast["common_camera_count"], full["common_camera_count"])
+
+
+def test_delayed_learning_rate_uses_absolute_endpoint():
+    schedule = get_expon_lr_func(
+        lr_init=1e-3,
+        lr_final=1e-5,
+        max_steps=30_000,
+        step_sub=15_000,
+    )
+
+    assert schedule(1) == 1e-3
+    assert schedule(15_000) == 1e-3
+    assert np.isclose(schedule(30_000), 1e-5)

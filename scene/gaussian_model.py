@@ -847,7 +847,12 @@ class GaussianModel(nn.Module):
                 lr_init=training_args.mlp_view_scaling_lr_init,
                 lr_final=training_args.mlp_view_scaling_lr_final,
                 lr_delay_mult=training_args.mlp_view_scaling_lr_delay_mult,
-                max_steps=max(training_args.iterations - training_args.update_until, 1),
+                # get_expon_lr_func interprets max_steps as an absolute endpoint
+                # when step_sub is set, rather than as a schedule duration.
+                max_steps=max(
+                    training_args.mlp_view_scaling_lr_max_steps,
+                    training_args.update_until + 1,
+                ),
                 step_sub=training_args.update_until,
             )
 
