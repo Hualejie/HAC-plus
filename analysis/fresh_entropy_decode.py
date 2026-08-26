@@ -1,0 +1,76 @@
+"""Decode a HAC++ attribute bitstream in a fresh process.
+
+This intentionally constructs no Scene and loads no training checkpoint.  The
+entropy package must therefore contain every network needed by attribute coding.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) in sys.path:
+    sys.path.remove(str(REPO_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
+
+from scene.gaussian_model import GaussianModel
+
+
+def _checksum(tensor):
+    array = tensor.detach().cpu().contiguous().numpy()
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bitstream", required=True)
+    parser.add_argument(
+        "--coview_target",
+        choices=("none", "feature", "scaling", "offset", "all"),
+        required=True,
+    )
+    parser.add_argument("--feat_dim", type=int, default=50)
+    parser.add_argument("--n_offsets", type=int, default=10)
+    parser.add_argument("--voxel_size", type=float, default=0.005)
+    parser.add_argument("--view_topology_k", type=int, default=8)
+    parser.add_argument("--view_topology_candidates", type=int, default=16)
+    parser.add_argument("--n_features", type=int, default=4)
+    parser.add_argument("--log2", type=int, default=13)
+    parser.add_argument("--log2_2D", type=int, default=15)
+    args = parser.parse_args()
+
+    model = GaussianModel(
+        feat_dim=args.feat_dim,
+        n_offsets=args.n_offsets,
+        voxel_size=args.voxel_size,
+        use_view_topology=True,
+        view_topology_k=args.view_topology_k,
+        view_topology_candidates=args.view_topology_candidates,
+        coview_target=args.coview_target,
+        n_features_per_level=args.n_features,
+        log2_hashmap_size=args.log2,
+        log2_hashmap_size_2D=args.log2_2D,
+        decoded_version=True,
+    )
+    model.eval()
+    log = model.conduct_decoding(os.path.abspath(args.bitstream))
+    result = {
+        "coview_target": args.coview_target,
+        "num_anchors": int(model._anchor.shape[0]),
+        "anchor_checksum": _checksum(model._anchor),
+        "feature_checksum": _checksum(model._anchor_feat),
+        "scaling_checksum": _checksum(model._scaling),
+        "offset_checksum": _checksum(model._offset),
+        "mask_checksum": _checksum(model._mask),
+        "decode_log": log,
+    }
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

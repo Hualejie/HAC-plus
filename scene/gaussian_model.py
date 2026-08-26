@@ -1684,17 +1684,19 @@ class GaussianModel(nn.Module):
         _mask = _mask[sorted_indices]
 
         topology_features = None
+        entropy_context = {
+            'version': 2,
+            'feat_dim': self.feat_dim,
+            'n_offsets': self.n_offsets,
+            'coview_target': self.coview_target,
+            'view_topology_k': self.view_topology_k,
+            'view_topology_candidates': self.view_topology_candidates,
+            'grid_mlp': self.mlp_grid.state_dict(),
+            'deform_mlp': self.mlp_deform.state_dict(),
+        }
         if self.coview_enabled:
             topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
-            torch.save({
-                'version': 2,
-                'feat_dim': self.feat_dim,
-                'n_offsets': self.n_offsets,
-                'coview_target': self.coview_target,
-                'view_topology_k': self.view_topology_k,
-                'view_topology_candidates': self.view_topology_candidates,
-                'grid_mlp': self.mlp_grid.state_dict(),
-                'deform_mlp': self.mlp_deform.state_dict(),
+            entropy_context.update({
                 'coview_shared_mlp': self.mlp_coview_shared.state_dict(),
                 'coview_heads': {
                     attribute: getattr(self, f'mlp_coview_{attribute}').state_dict()
@@ -1707,7 +1709,10 @@ class GaussianModel(nn.Module):
                 'camera_geometry': camera_geometry_state(self._view_topology_cameras),
                 'topology_feature_checksum': topology_diagnostics['feature_checksum'],
                 'topology_diagnostics': topology_diagnostics,
-            }, os.path.join(pre_path_name, 'entropy_context.pth'))
+            })
+        # The baseline also needs mlp_grid/mlp_deform in a fresh process.  A
+        # resident training model is not part of the entropy-decoder contract.
+        torch.save(entropy_context, os.path.join(pre_path_name, 'entropy_context.pth'))
 
         torch.save(self.x_bound_min, os.path.join(pre_path_name, 'x_bound_min.pkl'))
         torch.save(self.x_bound_max, os.path.join(pre_path_name, 'x_bound_max.pkl'))
@@ -1882,25 +1887,24 @@ class GaussianModel(nn.Module):
         self.x_bound_min = torch.load(os.path.join(pre_path_name, 'x_bound_min.pkl'))
         self.x_bound_max = torch.load(os.path.join(pre_path_name, 'x_bound_max.pkl'))
 
-        entropy_context = None
+        entropy_context = torch.load(os.path.join(pre_path_name, 'entropy_context.pth'))
+        expected_config = {
+            'version': 2,
+            'feat_dim': self.feat_dim,
+            'n_offsets': self.n_offsets,
+            'coview_target': self.coview_target,
+            'view_topology_k': self.view_topology_k,
+            'view_topology_candidates': self.view_topology_candidates,
+        }
+        for key, expected in expected_config.items():
+            if entropy_context.get(key) != expected:
+                raise RuntimeError(
+                    f"entropy context {key} mismatch: "
+                    f"{entropy_context.get(key)!r} != {expected!r}"
+                )
+        self.mlp_grid.load_state_dict(entropy_context['grid_mlp'])
+        self.mlp_deform.load_state_dict(entropy_context['deform_mlp'])
         if self.coview_enabled:
-            entropy_context = torch.load(os.path.join(pre_path_name, 'entropy_context.pth'))
-            expected_config = {
-                'version': 2,
-                'feat_dim': self.feat_dim,
-                'n_offsets': self.n_offsets,
-                'coview_target': self.coview_target,
-                'view_topology_k': self.view_topology_k,
-                'view_topology_candidates': self.view_topology_candidates,
-            }
-            for key, expected in expected_config.items():
-                if entropy_context.get(key) != expected:
-                    raise RuntimeError(
-                        f"entropy context {key} mismatch: "
-                        f"{entropy_context.get(key)!r} != {expected!r}"
-                    )
-            self.mlp_grid.load_state_dict(entropy_context['grid_mlp'])
-            self.mlp_deform.load_state_dict(entropy_context['deform_mlp'])
             self.mlp_coview_shared.load_state_dict(entropy_context['coview_shared_mlp'])
             for attribute in self.active_coview_attributes():
                 getattr(self, f'mlp_coview_{attribute}').load_state_dict(
