@@ -2697,6 +2697,20 @@ class GaussianModel(nn.Module):
         self._anchor = nn.Parameter(_anchor)
         self._scaling = nn.Parameter(_scaling)
         self._mask = nn.Parameter(_mask)
+        # Rotation and opacity are fixed constants throughout HAC++ training and
+        # are therefore not entropy coded.  Rebuild them for a standalone
+        # decoder instead of retaining scene-initialization tensors whose anchor
+        # count may differ from the decoded package.
+        decoded_rotation = torch.zeros((N, 4), device=_anchor.device)
+        decoded_rotation[:, 0] = 1.0
+        self._rotation = nn.Parameter(decoded_rotation, requires_grad=False)
+        self._opacity = nn.Parameter(
+            inverse_sigmoid(
+                0.1 * torch.ones((N, 1), device=_anchor.device)
+            ),
+            requires_grad=False,
+        )
+        self.max_radii2D = torch.zeros(N, device=_anchor.device)
 
         print('Parameters are successfully replaced by decoded ones!')
 
