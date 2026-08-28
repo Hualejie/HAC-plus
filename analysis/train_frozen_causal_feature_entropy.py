@@ -209,6 +209,12 @@ def optimize_prior(model, prior, fixed, graph, pretrain_schedule, schedule, args
         name: value.to(next(prior.parameters()).device)
         for name, value in best_expert_state.items()
     })
+    with torch.no_grad():
+        if isinstance(prior, AffineCausalFeaturePrior):
+            prior.gate_logit.fill_(args.fusion_gate_init)
+        else:
+            prior.network[-1].weight[-1].zero_()
+            prior.network[-1].bias[-1].fill_(args.fusion_gate_init)
 
     optimizer = torch.optim.Adam(prior.parameters(), lr=args.lr, eps=1e-15)
     prior.eval()
@@ -300,6 +306,7 @@ def main():
         "--causal_prior_type", choices=("mlp", "affine"), default="mlp"
     )
     parser.add_argument("--causal_max_mixture_weight", type=float, default=0.25)
+    parser.add_argument("--fusion_gate_init", type=float, default=-2.0)
     parser.add_argument("--validation_size", type=int, default=12000)
     parser.add_argument("--feat_dim", type=int, default=50)
     parser.add_argument("--n_offsets", type=int, default=10)
@@ -408,6 +415,7 @@ def main():
             "causal_hidden_dim": args.causal_hidden_dim,
             "causal_prior_type": args.causal_prior_type,
             "causal_max_mixture_weight": args.causal_max_mixture_weight,
+            "fusion_gate_init": args.fusion_gate_init,
             "n_features": args.n_features,
             "log2": args.log2,
             "log2_2D": args.log2_2D,
