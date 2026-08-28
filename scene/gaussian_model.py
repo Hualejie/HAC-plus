@@ -813,10 +813,19 @@ class GaussianModel(nn.Module):
         neighbor_q = self.feature_quantization_steps(
             self.get_anchor[unique_original]
         )
-        decoded_neighbor = STE_multistep.apply(
+        quantized_neighbor = STE_multistep.apply(
             self._anchor_feat[unique_original],
             neighbor_q,
             self._anchor_feat.mean(),
+        )
+        # HAC++'s STE_multistep backward only supports its two-argument form,
+        # while codec-equivalent clamping needs the global third-argument
+        # mean. Preserve that exact forward value and attach an explicit
+        # identity straight-through gradient to the Feature symbols.
+        decoded_neighbor = (
+            quantized_neighbor.detach()
+            + self._anchor_feat[unique_original]
+            - self._anchor_feat[unique_original].detach()
         )
         gathered = decoded_neighbor[inverse].view(
             *neighbor_original.shape, self.feat_dim
