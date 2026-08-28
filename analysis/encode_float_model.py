@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from scene.coview_context import camera_geometry_from_state
 from scene.gaussian_model import GaussianModel
+from utils.coview_serialization import deserialize_named_tensors
 
 
 def main():
@@ -48,6 +49,10 @@ def main():
     parser.add_argument("--causal_coview_groups", type=int, default=4)
     parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
     parser.add_argument("--causal_coview_gate_init", type=float, default=4.0)
+    parser.add_argument(
+        "--causal_prior",
+        help="optional frozen causal_feature_model.bin used to initialize the formal codec",
+    )
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -79,7 +84,25 @@ def main():
         log2_hashmap_size_2D=args.log2_2D,
     )
     model.load_ply_sparse_gaussian(str(float_path / "point_cloud.ply"))
-    model.load_mlp_checkpoints(str(float_path / "checkpoint.pth"))
+    model.load_mlp_checkpoints(
+        str(float_path / "checkpoint.pth"),
+        load_causal_feature_prior=not bool(args.causal_prior),
+    )
+    if args.causal_prior:
+        if not model.causal_coview_enabled:
+            raise ValueError("--causal_prior requires --use_causal_coview_feature")
+        causal_state, _ = deserialize_named_tensors(args.causal_prior)
+        expected = set(model.causal_coview_feature_prior.state_dict())
+        if set(causal_state) != expected:
+            raise RuntimeError(
+                "frozen causal prior state mismatch: "
+                f"missing={sorted(expected - set(causal_state))}, "
+                f"extra={sorted(set(causal_state) - expected)}"
+            )
+        device = next(model.causal_coview_feature_prior.parameters()).device
+        model.causal_coview_feature_prior.load_state_dict({
+            name: tensor.to(device) for name, tensor in causal_state.items()
+        })
     model.x_bound_min = torch.load(float_path / "x_bound_min.pkl")
     model.x_bound_max = torch.load(float_path / "x_bound_max.pkl")
     if model.entropy_extension_enabled:

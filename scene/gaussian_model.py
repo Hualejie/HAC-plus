@@ -1835,6 +1835,7 @@ class GaussianModel(nn.Module):
         path,
         load_coview_feature_head=True,
         validate_topology_config=True,
+        load_causal_feature_prior=True,
     ):
         checkpoint = torch.load(path)
         self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
@@ -1883,7 +1884,7 @@ class GaussianModel(nn.Module):
             self.mlp_coview_scaling.load_state_dict(checkpoint['coview_scaling_head'])
             self.mlp_coview_offset.load_state_dict(checkpoint['coview_offset_head'])
             self.coview_gates.load_state_dict(checkpoint['coview_gates'])
-        if self.causal_coview_enabled:
+        if self.causal_coview_enabled and load_causal_feature_prior:
             if not checkpoint.get('use_causal_coview_feature', False):
                 raise KeyError("checkpoint is missing causal CoView Feature state")
             expected = {
