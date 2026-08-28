@@ -127,38 +127,48 @@ def extract_camera_geometry(cameras: Sequence) -> Tuple[SimpleNamespace, ...]:
 
 
 def camera_geometry_state(cameras: Sequence) -> Dict[str, object]:
-    """Pack canonical camera geometry without one pickle/tensor header per field."""
+    """Pack canonical camera geometry into one float32 tensor."""
     geometry = extract_camera_geometry(cameras)
     if not geometry:
         raise ValueError("at least one camera is required for CoView geometry")
+    rows = []
+    for camera in geometry:
+        rows.append(torch.cat((
+            camera.full_proj_transform.to(dtype=torch.float32).reshape(-1),
+            camera.world_view_transform.to(dtype=torch.float32).reshape(-1),
+            torch.tensor([
+                camera.image_width,
+                camera.image_height,
+                camera.znear,
+                camera.zfar,
+            ], dtype=torch.float32),
+        )))
     return {
-        "format": "packed_v1",
-        "image_names": tuple(camera.image_name for camera in geometry),
-        "colmap_ids": torch.tensor(
-            [camera.colmap_id for camera in geometry], dtype=torch.int32
-        ),
-        "uids": torch.tensor(
-            [camera.uid for camera in geometry], dtype=torch.int32
-        ),
-        "full_proj_transform": torch.stack([
-            camera.full_proj_transform.to(dtype=torch.float32)
-            for camera in geometry
-        ]),
-        "world_view_transform": torch.stack([
-            camera.world_view_transform.to(dtype=torch.float32)
-            for camera in geometry
-        ]),
-        "image_size": torch.tensor([
-            [camera.image_width, camera.image_height] for camera in geometry
-        ], dtype=torch.int32),
-        "clip": torch.tensor([
-            [camera.znear, camera.zfar] for camera in geometry
-        ], dtype=torch.float32),
+        "format": "packed_v2",
+        "data": torch.stack(rows),
     }
 
 
 def camera_geometry_from_state(state) -> Tuple[SimpleNamespace, ...]:
-    """Restore packed-v1 or legacy per-camera geometry packages."""
+    """Restore packed-v2, packed-v1, or legacy camera geometry packages."""
+    if isinstance(state, Mapping) and state.get("format") == "packed_v2":
+        data = torch.as_tensor(state["data"])
+        if data.ndim != 2 or data.shape[1] != 36 or data.shape[0] == 0:
+            raise ValueError(
+                "packed camera geometry data must have shape [M, 36] with M > 0"
+            )
+        cameras = [SimpleNamespace(
+            image_name=f"camera_{index:08d}",
+            colmap_id=index,
+            uid=index,
+            full_proj_transform=data[index, :16].reshape(4, 4),
+            world_view_transform=data[index, 16:32].reshape(4, 4),
+            image_width=int(data[index, 32]),
+            image_height=int(data[index, 33]),
+            znear=float(data[index, 34]),
+            zfar=float(data[index, 35]),
+        ) for index in range(data.shape[0])]
+        return extract_camera_geometry(cameras)
     if isinstance(state, Mapping) and state.get("format") == "packed_v1":
         names = tuple(state["image_names"])
         colmap_ids = torch.as_tensor(state["colmap_ids"])

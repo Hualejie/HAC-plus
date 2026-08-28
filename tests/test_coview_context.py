@@ -280,13 +280,18 @@ def test_view_topology_camera_package_round_trip():
     state = camera_geometry_state(cameras)
     restored = camera_geometry_from_state(state)
 
-    assert state["format"] == "packed_v1"
-    assert state["full_proj_transform"].shape == (2, 4, 4)
-    assert state["world_view_transform"].shape == (2, 4, 4)
-    assert [camera.image_name for camera in restored] == ["a", "b"]
+    assert state["format"] == "packed_v2"
+    assert state["data"].shape == (2, 36)
+    torch.testing.assert_close(
+        state["data"], camera_geometry_state(list(reversed(cameras)))["data"]
+    )
     for before, after in zip(sorted(cameras, key=lambda camera: camera.image_name), restored):
         torch.testing.assert_close(before.full_proj_transform, after.full_proj_transform)
         torch.testing.assert_close(before.world_view_transform, after.world_view_transform)
+        assert before.image_width == after.image_width
+        assert before.image_height == after.image_height
+        assert np.isclose(before.znear, after.znear)
+        assert np.isclose(before.zfar, after.zfar)
 
 
 def test_legacy_camera_package_remains_decodable():
