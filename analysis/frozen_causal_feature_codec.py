@@ -83,6 +83,7 @@ def causal_feature_components(
         neighbor_mean[:, feature_slice],
         neighbor_std[:, feature_slice],
         support,
+        chunk_indices=None if chunk is None else (chunk,),
     )
     causal_weight = torch.clamp(
         causal_weight, min=0.0, max=1.0 - 1e-6

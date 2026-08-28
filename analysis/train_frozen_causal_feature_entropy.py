@@ -32,6 +32,7 @@ from analysis.train_frozen_feature_entropy import (
     capture_fixed_representation,
 )
 from scene.coview_causal_context import (
+    AffineCausalFeaturePrior,
     CausalFeaturePrior,
     build_causal_anchor_graph,
     causal_neighbor_statistics,
@@ -295,6 +296,9 @@ def main():
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--causal_groups", type=int, default=4)
     parser.add_argument("--causal_hidden_dim", type=int, default=16)
+    parser.add_argument(
+        "--causal_prior_type", choices=("mlp", "affine"), default="mlp"
+    )
     parser.add_argument("--causal_max_mixture_weight", type=float, default=0.25)
     parser.add_argument("--validation_size", type=int, default=12000)
     parser.add_argument("--feat_dim", type=int, default=50)
@@ -348,10 +352,15 @@ def main():
         0, train_pool.size,
         size=(args.steps, args.batch_size), dtype=np.int32,
     )]
-    prior = CausalFeaturePrior(
-        args.causal_hidden_dim,
-        max_mixture_weight=args.causal_max_mixture_weight,
-    ).cuda()
+    if args.causal_prior_type == "mlp":
+        prior = CausalFeaturePrior(
+            args.causal_hidden_dim,
+            max_mixture_weight=args.causal_max_mixture_weight,
+        ).cuda()
+    else:
+        prior = AffineCausalFeaturePrior(
+            max_mixture_weight=args.causal_max_mixture_weight,
+        ).cuda()
     training_metrics = optimize_prior(
         model, prior, fixed, graph, pretrain_schedule, schedule, args
     )
@@ -397,6 +406,7 @@ def main():
             "view_topology_view_candidates": args.view_topology_view_candidates,
             "causal_groups": args.causal_groups,
             "causal_hidden_dim": args.causal_hidden_dim,
+            "causal_prior_type": args.causal_prior_type,
             "causal_max_mixture_weight": args.causal_max_mixture_weight,
             "n_features": args.n_features,
             "log2": args.log2,

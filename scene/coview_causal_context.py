@@ -156,6 +156,7 @@ class CausalFeaturePrior(nn.Module):
         neighbor_mean: torch.Tensor,
         neighbor_std: torch.Tensor,
         support: torch.Tensor,
+        chunk_indices=None,
     ):
         """Evaluate one or more complete 10-channel Feature chunks."""
         if base_mean.shape[-1] % FEATURE_CHUNK_DIM:
@@ -202,6 +203,96 @@ class CausalFeaturePrior(nn.Module):
         mixture_weight = (
             self.max_mixture_weight * torch.sigmoid(gate_logit) * chunk_support
         )
+        return (
+            causal_mean.reshape_as(base_mean),
+            causal_scale.reshape_as(base_scale),
+            mixture_weight.repeat_interleave(
+                FEATURE_CHUNK_DIM, dim=1
+            ).reshape_as(base_mean),
+        )
+
+
+class AffineCausalFeaturePrior(nn.Module):
+    """Fifteen-parameter causal prior shared with HAC++ mixture moments."""
+
+    def __init__(self, max_mixture_weight: float = 0.25):
+        super().__init__()
+        if not 0.0 < max_mixture_weight <= 1.0:
+            raise ValueError("max_mixture_weight must be in (0, 1]")
+        self.max_mixture_weight = float(max_mixture_weight)
+        self.mean_blend = nn.Parameter(torch.zeros(FEATURE_CHUNKS))
+        self.log_scale_blend = nn.Parameter(torch.zeros(FEATURE_CHUNKS))
+        self.gate_logit = nn.Parameter(torch.full((FEATURE_CHUNKS,), -8.0))
+
+    def forward(
+        self,
+        base_mean,
+        base_scale,
+        q_feature,
+        neighbor_mean,
+        neighbor_std,
+        support,
+    ):
+        return self.forward_selected(
+            base_mean,
+            base_scale,
+            q_feature,
+            neighbor_mean,
+            neighbor_std,
+            support,
+        )
+
+    def forward_selected(
+        self,
+        base_mean,
+        base_scale,
+        q_feature,
+        neighbor_mean,
+        neighbor_std,
+        support,
+        chunk_indices=None,
+    ):
+        if base_mean.shape[-1] % FEATURE_CHUNK_DIM:
+            raise ValueError("selected Feature channels must contain full chunks")
+        batch = base_mean.shape[0]
+        num_chunks = base_mean.shape[-1] // FEATURE_CHUNK_DIM
+        if chunk_indices is None:
+            if num_chunks != FEATURE_CHUNKS:
+                raise ValueError("chunk_indices are required for a Feature subset")
+            chunk_indices = tuple(range(FEATURE_CHUNKS))
+        if len(chunk_indices) != num_chunks:
+            raise ValueError("chunk_indices length does not match selected Feature chunks")
+        parameter_indices = torch.as_tensor(
+            chunk_indices, dtype=torch.long, device=base_mean.device
+        )
+        base_mean_chunks = base_mean.view(batch, num_chunks, FEATURE_CHUNK_DIM)
+        base_scale_chunks = torch.clamp(
+            base_scale.view(batch, num_chunks, FEATURE_CHUNK_DIM), min=1e-9
+        )
+        q_chunks = q_feature.view(batch, num_chunks, FEATURE_CHUNK_DIM)
+        neighbor_mean_chunks = neighbor_mean.view(
+            batch, num_chunks, FEATURE_CHUNK_DIM
+        )
+        neighbor_std_chunks = neighbor_std.view(
+            batch, num_chunks, FEATURE_CHUNK_DIM
+        )
+        beta = torch.tanh(self.mean_blend[parameter_indices])[None, :, None]
+        gamma = self.log_scale_blend[parameter_indices][None, :, None]
+        causal_mean = base_mean_chunks + beta * (
+            neighbor_mean_chunks - base_mean_chunks
+        )
+        relative_std = torch.log(torch.clamp(
+            (neighbor_std_chunks + 0.5 * q_chunks) / base_scale_chunks,
+            min=1e-6,
+            max=1e6,
+        ))
+        causal_scale = base_scale_chunks * torch.exp(torch.clamp(
+            gamma * relative_std, min=-5.0, max=5.0
+        ))
+        gate = self.max_mixture_weight * torch.sigmoid(
+            self.gate_logit[parameter_indices]
+        )[None, :, None]
+        mixture_weight = gate * support[:, None, :]
         return (
             causal_mean.reshape_as(base_mean),
             causal_scale.reshape_as(base_scale),

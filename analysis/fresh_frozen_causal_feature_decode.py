@@ -15,7 +15,11 @@ sys.path.insert(0, str(REPO_ROOT))
 from analysis.frozen_causal_feature_codec import decode_causal_feature_symbols
 from analysis.frozen_feature_codec import tensor_checksum
 from analysis.train_frozen_causal_feature_entropy import graph_checksum
-from scene.coview_causal_context import CausalFeaturePrior, build_causal_anchor_graph
+from scene.coview_causal_context import (
+    AffineCausalFeaturePrior,
+    CausalFeaturePrior,
+    build_causal_anchor_graph,
+)
 from scene.coview_context import (
     build_view_topology_context,
     camera_geometry_from_state,
@@ -68,10 +72,15 @@ def main():
     if graph_checksum(graph) != context["graph_checksum"]:
         raise RuntimeError("fresh decoder causal graph checksum mismatch")
 
-    prior = CausalFeaturePrior(
-        config["causal_hidden_dim"],
-        max_mixture_weight=config["causal_max_mixture_weight"],
-    ).cuda()
+    if config.get("causal_prior_type", "mlp") == "mlp":
+        prior = CausalFeaturePrior(
+            config["causal_hidden_dim"],
+            max_mixture_weight=config["causal_max_mixture_weight"],
+        ).cuda()
+    else:
+        prior = AffineCausalFeaturePrior(
+            max_mixture_weight=config["causal_max_mixture_weight"],
+        ).cuda()
     prior_state, prior_metadata = deserialize_named_tensors(
         package_path / context["causal_model_file"]
     )

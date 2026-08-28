@@ -2,6 +2,7 @@ import numpy as np
 import torch
 
 from scene.coview_causal_context import (
+    AffineCausalFeaturePrior,
     CausalFeaturePrior,
     build_causal_anchor_graph,
     causal_neighbor_statistics,
@@ -102,3 +103,21 @@ def test_causal_feature_prior_preserves_5x10_shapes_and_zero_support():
         support,
     )
     assert all(value.shape == (2, 10) for value in selected)
+
+
+def test_affine_prior_uses_only_fifteen_parameters_and_chunk_identity():
+    prior = AffineCausalFeaturePrior()
+    assert sum(parameter.numel() for parameter in prior.parameters()) == 15
+    values = torch.zeros(2, 10)
+    support = torch.tensor([[0.0], [1.0]])
+    output = prior.forward_selected(
+        values,
+        torch.ones_like(values),
+        torch.ones_like(values),
+        torch.full_like(values, 0.5),
+        torch.ones_like(values),
+        support,
+        chunk_indices=(3,),
+    )
+    assert all(value.shape == (2, 10) for value in output)
+    assert torch.all(output[2][0] == 0)
