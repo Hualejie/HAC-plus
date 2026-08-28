@@ -126,24 +126,85 @@ def extract_camera_geometry(cameras: Sequence) -> Tuple[SimpleNamespace, ...]:
     return tuple(geometry)
 
 
-def camera_geometry_state(cameras: Sequence) -> Tuple[Dict[str, object], ...]:
-    """Return a torch-serializable camera geometry package."""
-    return tuple({
-        "image_name": camera.image_name,
-        "colmap_id": camera.colmap_id,
-        "uid": camera.uid,
-        "full_proj_transform": camera.full_proj_transform,
-        "world_view_transform": camera.world_view_transform,
-        "image_width": camera.image_width,
-        "image_height": camera.image_height,
-        "znear": camera.znear,
-        "zfar": camera.zfar,
-    } for camera in extract_camera_geometry(cameras))
+def camera_geometry_state(cameras: Sequence) -> Dict[str, object]:
+    """Pack canonical camera geometry without one pickle/tensor header per field."""
+    geometry = extract_camera_geometry(cameras)
+    if not geometry:
+        raise ValueError("at least one camera is required for CoView geometry")
+    return {
+        "format": "packed_v1",
+        "image_names": tuple(camera.image_name for camera in geometry),
+        "colmap_ids": torch.tensor(
+            [camera.colmap_id for camera in geometry], dtype=torch.int32
+        ),
+        "uids": torch.tensor(
+            [camera.uid for camera in geometry], dtype=torch.int32
+        ),
+        "full_proj_transform": torch.stack([
+            camera.full_proj_transform.to(dtype=torch.float32)
+            for camera in geometry
+        ]),
+        "world_view_transform": torch.stack([
+            camera.world_view_transform.to(dtype=torch.float32)
+            for camera in geometry
+        ]),
+        "image_size": torch.tensor([
+            [camera.image_width, camera.image_height] for camera in geometry
+        ], dtype=torch.int32),
+        "clip": torch.tensor([
+            [camera.znear, camera.zfar] for camera in geometry
+        ], dtype=torch.float32),
+    }
 
 
-def camera_geometry_from_state(state: Sequence[Mapping[str, object]]) -> Tuple[SimpleNamespace, ...]:
-    """Restore and canonicalize the camera geometry package."""
-    return extract_camera_geometry([SimpleNamespace(**dict(item)) for item in state])
+def camera_geometry_from_state(state) -> Tuple[SimpleNamespace, ...]:
+    """Restore packed-v1 or legacy per-camera geometry packages."""
+    if isinstance(state, Mapping) and state.get("format") == "packed_v1":
+        names = tuple(state["image_names"])
+        colmap_ids = torch.as_tensor(state["colmap_ids"])
+        uids = torch.as_tensor(state["uids"])
+        full_proj = torch.as_tensor(state["full_proj_transform"])
+        world_view = torch.as_tensor(state["world_view_transform"])
+        image_size = torch.as_tensor(state["image_size"])
+        clip = torch.as_tensor(state["clip"])
+        count = len(names)
+        expected_shapes = {
+            "colmap_ids": (count,),
+            "uids": (count,),
+            "full_proj_transform": (count, 4, 4),
+            "world_view_transform": (count, 4, 4),
+            "image_size": (count, 2),
+            "clip": (count, 2),
+        }
+        values = {
+            "colmap_ids": colmap_ids,
+            "uids": uids,
+            "full_proj_transform": full_proj,
+            "world_view_transform": world_view,
+            "image_size": image_size,
+            "clip": clip,
+        }
+        for name, expected in expected_shapes.items():
+            if tuple(values[name].shape) != expected:
+                raise ValueError(
+                    f"packed camera geometry {name} has shape "
+                    f"{tuple(values[name].shape)}, expected {expected}"
+                )
+        cameras = [SimpleNamespace(
+            image_name=str(names[index]),
+            colmap_id=int(colmap_ids[index]),
+            uid=int(uids[index]),
+            full_proj_transform=full_proj[index],
+            world_view_transform=world_view[index],
+            image_width=int(image_size[index, 0]),
+            image_height=int(image_size[index, 1]),
+            znear=float(clip[index, 0]),
+            zfar=float(clip[index, 1]),
+        ) for index in range(count)]
+        return extract_camera_geometry(cameras)
+    return extract_camera_geometry([
+        SimpleNamespace(**dict(item)) for item in state
+    ])
 
 
 def build_geometry_observations(

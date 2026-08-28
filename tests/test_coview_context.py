@@ -280,10 +280,30 @@ def test_view_topology_camera_package_round_trip():
     state = camera_geometry_state(cameras)
     restored = camera_geometry_from_state(state)
 
+    assert state["format"] == "packed_v1"
+    assert state["full_proj_transform"].shape == (2, 4, 4)
+    assert state["world_view_transform"].shape == (2, 4, 4)
     assert [camera.image_name for camera in restored] == ["a", "b"]
     for before, after in zip(sorted(cameras, key=lambda camera: camera.image_name), restored):
         torch.testing.assert_close(before.full_proj_transform, after.full_proj_transform)
         torch.testing.assert_close(before.world_view_transform, after.world_view_transform)
+
+
+def test_legacy_camera_package_remains_decodable():
+    cameras = [_camera("b", 1), _camera("a", 0)]
+    legacy = tuple({
+        "image_name": camera.image_name,
+        "colmap_id": camera.colmap_id,
+        "uid": camera.uid,
+        "full_proj_transform": camera.full_proj_transform,
+        "world_view_transform": camera.world_view_transform,
+        "image_width": camera.image_width,
+        "image_height": camera.image_height,
+        "znear": camera.znear,
+        "zfar": camera.zfar,
+    } for camera in cameras)
+    restored = camera_geometry_from_state(legacy)
+    assert [camera.image_name for camera in restored] == ["a", "b"]
 
 
 def test_distance_depth_fast_path_matches_full_geometric_scores():
