@@ -52,10 +52,13 @@ from scene.coview_context import (
 )
 from scene.coview_causal_context import (
     AffineCausalFeaturePrior,
+    AffineCausalScalingPrior,
     build_causal_anchor_graph,
     causal_neighbor_statistics,
     decode_causal_feature_symbols,
+    decode_causal_scaling_symbols,
     encode_causal_feature_symbols,
+    encode_causal_scaling_symbols,
     mixture_moments,
 )
 
@@ -287,6 +290,7 @@ class GaussianModel(nn.Module):
                  coview_target: str="none",
                  coview_feature_mode: str="full",
                  use_causal_coview_feature: bool=False,
+                 use_causal_coview_scaling: bool=False,
                  causal_coview_groups: int=4,
                  causal_coview_candidates: int=32,
                  causal_coview_max_weight: float=0.25,
@@ -345,16 +349,17 @@ class GaussianModel(nn.Module):
             raise ValueError("chunk-level Feature CoView requires feat_dim divisible by 10")
         self.coview_feature_mode = coview_feature_mode
         self.use_causal_coview_feature = use_causal_coview_feature
+        self.use_causal_coview_scaling = use_causal_coview_scaling
         self.causal_coview_groups = int(causal_coview_groups)
         self.causal_coview_candidates = int(causal_coview_candidates)
         self.causal_coview_max_weight = float(causal_coview_max_weight)
         self.causal_coview_gate_init = float(causal_coview_gate_init)
         if self.use_causal_coview_feature and self.feat_dim != 50:
             raise ValueError("causal CoView Feature currently requires feat_dim=50")
-        if self.use_causal_coview_feature and self.causal_coview_groups < 2:
+        if self.causal_coview_enabled and self.causal_coview_groups < 2:
             raise ValueError("causal_coview_groups must be at least two")
         if (
-            self.use_causal_coview_feature
+            self.causal_coview_enabled
             and self.causal_coview_candidates < self.view_topology_k
         ):
             raise ValueError(
@@ -518,6 +523,14 @@ class GaussianModel(nn.Module):
                 self.causal_coview_feature_prior.gate_logit.fill_(
                     self.causal_coview_gate_init
                 )
+        if self.use_causal_coview_scaling:
+            self.causal_coview_scaling_prior = AffineCausalScalingPrior(
+                max_mixture_weight=self.causal_coview_max_weight
+            ).cuda()
+            with torch.no_grad():
+                self.causal_coview_scaling_prior.gate_logit.fill_(
+                    self.causal_coview_gate_init
+                )
 
         self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
         self.EG_mix_prob_2 = Entropy_gaussian_mix_prob_2(Q=1).cuda()
@@ -561,7 +574,15 @@ class GaussianModel(nn.Module):
 
     @property
     def causal_coview_enabled(self):
+        return self.causal_feature_enabled or self.causal_scaling_enabled
+
+    @property
+    def causal_feature_enabled(self):
         return getattr(self, "use_causal_coview_feature", False)
+
+    @property
+    def causal_scaling_enabled(self):
+        return getattr(self, "use_causal_coview_scaling", False)
 
     @property
     def uses_view_geometry(self):
@@ -588,10 +609,16 @@ class GaussianModel(nn.Module):
                 coview_bits += sum(p.numel() * digit for p in head.parameters())
                 coview_bits += self.coview_gates[attribute].numel() * digit
         if self.causal_coview_enabled:
-            coview_bits += sum(
-                p.numel() * digit
-                for p in self.causal_coview_feature_prior.parameters()
-            )
+            if self.causal_feature_enabled:
+                coview_bits += sum(
+                    p.numel() * digit
+                    for p in self.causal_coview_feature_prior.parameters()
+                )
+            if self.causal_scaling_enabled:
+                coview_bits += sum(
+                    p.numel() * digit
+                    for p in self.causal_coview_scaling_prior.parameters()
+                )
         return {
             "base_bits": base_bits,
             "active_coview_bits": coview_bits,
@@ -611,9 +638,12 @@ class GaussianModel(nn.Module):
                 for name, tensor in getattr(self, f"mlp_coview_{attribute}").state_dict().items():
                     state[f"head.{attribute}.{name}"] = tensor
                 state[f"gate.{attribute}"] = self.coview_gates[attribute].detach()
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             for name, tensor in self.causal_coview_feature_prior.state_dict().items():
                 state[f"causal_feature.{name}"] = tensor
+        if self.causal_scaling_enabled:
+            for name, tensor in self.causal_coview_scaling_prior.state_dict().items():
+                state[f"causal_scaling.{name}"] = tensor
         return state
 
     def install_coview_serializable_state(self, state):
@@ -642,10 +672,18 @@ class GaussianModel(nn.Module):
                 self.coview_gates[attribute].data.copy_(
                     state[f"gate.{attribute}"].to(device)
                 )
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             prefix = "causal_feature."
             device = next(self.causal_coview_feature_prior.parameters()).device
             self.causal_coview_feature_prior.load_state_dict({
+                name[len(prefix):]: tensor.to(device)
+                for name, tensor in state.items()
+                if name.startswith(prefix)
+            })
+        if self.causal_scaling_enabled:
+            prefix = "causal_scaling."
+            device = next(self.causal_coview_scaling_prior.parameters()).device
+            self.causal_coview_scaling_prior.load_state_dict({
                 name[len(prefix):]: tensor.to(device)
                 for name, tensor in state.items()
                 if name.startswith(prefix)
@@ -775,9 +813,23 @@ class GaussianModel(nn.Module):
         )
         return (1.0 + torch.tanh(outputs[7])).repeat(1, self.feat_dim)
 
+    def scaling_quantization_steps(self, anchor):
+        outputs = torch.split(
+            self.get_grid_mlp(self.calc_interp_feat(anchor)),
+            [
+                self.feat_dim, self.feat_dim, self.feat_dim,
+                6, 6, 3 * self.n_offsets, 3 * self.n_offsets,
+                1, 1, 1,
+            ],
+            dim=-1,
+        )
+        return 0.001 * (
+            1.0 + torch.tanh(outputs[8])
+        ).repeat(1, 6)
+
     def training_causal_feature_statistics(self, anchor_selection):
         """Gather decoded-equivalent earlier-group Feature context for a sample."""
-        if not self.causal_coview_enabled:
+        if not self.causal_feature_enabled:
             raise RuntimeError("causal CoView Feature is disabled")
         if self._training_causal_graph is None:
             raise RuntimeError("training causal CoView graph has not been built")
@@ -844,6 +896,66 @@ class GaussianModel(nn.Module):
         # the current conditional. Stop cross-anchor gradients (in particular
         # through sqrt(variance) at zero support) while retaining gradients for
         # the current symbol, HAC++ predictor and causal-prior parameters.
+        return (
+            output_mean.detach(),
+            output_std.detach(),
+            output_support.detach(),
+        )
+
+    def training_causal_scaling_statistics(self, anchor_selection):
+        """Gather decoded-equivalent earlier-group Scaling context."""
+        if not self.causal_scaling_enabled:
+            raise RuntimeError("causal CoView Scaling is disabled")
+        if self._training_causal_graph is None:
+            raise RuntimeError("training causal CoView graph has not been built")
+        selected_original = torch.nonzero(anchor_selection, as_tuple=False)[:, 0]
+        selected_canonical = self._training_causal_original_to_canonical[
+            selected_original
+        ]
+        output_mean = torch.zeros(
+            selected_original.numel(), 6,
+            device=self.get_anchor.device, dtype=self.get_scaling.dtype,
+        )
+        output_std = torch.zeros_like(output_mean)
+        output_support = torch.zeros(
+            selected_original.numel(), 1,
+            device=self.get_anchor.device, dtype=self.get_scaling.dtype,
+        )
+        selected_valid = selected_canonical >= 0
+        if not torch.any(selected_valid):
+            return output_mean, output_std, output_support
+
+        graph = self._training_causal_graph
+        rows = selected_canonical[selected_valid].cpu()
+        neighbors = graph.neighbors[rows]
+        weights = graph.weights[rows].to(self.get_anchor.device)
+        support = graph.support[rows].to(self.get_anchor.device)
+        safe_neighbors = torch.clamp(neighbors, min=0).to(self.get_anchor.device)
+        neighbor_original = self._training_causal_canonical_to_original[
+            safe_neighbors
+        ]
+        unique_original, inverse = torch.unique(
+            neighbor_original.reshape(-1), return_inverse=True
+        )
+        neighbor_q = self.scaling_quantization_steps(
+            self.get_anchor[unique_original]
+        )
+        decoded_neighbor = STE_multistep.apply(
+            self.get_scaling[unique_original],
+            neighbor_q,
+            self.get_scaling.mean(),
+        ).detach()
+        gathered = decoded_neighbor[inverse].view(*neighbor_original.shape, 6)
+        valid_edges = (neighbors >= 0).to(self.get_anchor.device)
+        effective_weights = weights * valid_edges.to(weights.dtype)
+        mean = (gathered * effective_weights[..., None]).sum(dim=1)
+        variance = (
+            (gathered - mean[:, None, :]).square()
+            * effective_weights[..., None]
+        ).sum(dim=1)
+        output_mean[selected_valid] = mean
+        output_std[selected_valid] = torch.sqrt(torch.clamp(variance, min=0.0))
+        output_support[selected_valid] = support
         return (
             output_mean.detach(),
             output_std.detach(),
@@ -997,8 +1109,10 @@ class GaussianModel(nn.Module):
             self.mlp_coview_feature.eval()
             self.mlp_coview_scaling.eval()
             self.mlp_coview_offset.eval()
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             self.causal_coview_feature_prior.eval()
+        if self.causal_scaling_enabled:
+            self.causal_coview_scaling_prior.eval()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
@@ -1015,8 +1129,10 @@ class GaussianModel(nn.Module):
             self.mlp_coview_feature.train()
             self.mlp_coview_scaling.train()
             self.mlp_coview_offset.train()
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             self.causal_coview_feature_prior.train()
+        if self.causal_scaling_enabled:
+            self.causal_coview_scaling_prior.train()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.train()
@@ -1040,8 +1156,10 @@ class GaussianModel(nn.Module):
                 "mlp_coview_offset": self.mlp_coview_offset,
                 "coview_gates": self.coview_gates,
             })
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             modules["causal_coview_feature_prior"] = self.causal_coview_feature_prior
+        if self.causal_scaling_enabled:
+            modules["causal_coview_scaling_prior"] = self.causal_coview_scaling_prior
         return modules
 
     def training_checkpoint_state(self):
@@ -1065,7 +1183,8 @@ class GaussianModel(nn.Module):
                 "view_topology_candidate_mode": self.view_topology_candidate_mode,
                 "view_topology_view_candidates": self.view_topology_view_candidates,
                 "coview_feature_mode": self.coview_feature_mode,
-                "use_causal_coview_feature": self.causal_coview_enabled,
+                "use_causal_coview_feature": self.causal_feature_enabled,
+                "use_causal_coview_scaling": self.causal_scaling_enabled,
                 "causal_coview_groups": getattr(self, "causal_coview_groups", 4),
                 "causal_coview_candidates": getattr(
                     self, "causal_coview_candidates", 32
@@ -1103,10 +1222,13 @@ class GaussianModel(nn.Module):
                 f"unsupported training checkpoint version {state.get('version')!r}"
             )
         architecture = state["architecture"]
-        branching_to_causal = (
-            self.causal_coview_enabled
-            and not architecture.get("use_causal_coview_feature", False)
-        )
+        branching_group_count = sum((
+            self.causal_feature_enabled
+            and not architecture.get("use_causal_coview_feature", False),
+            self.causal_scaling_enabled
+            and not architecture.get("use_causal_coview_scaling", False),
+        ))
+        branching_to_causal = branching_group_count > 0
         expected = {
             "feat_dim": self.feat_dim,
             "n_offsets": self.n_offsets,
@@ -1117,7 +1239,8 @@ class GaussianModel(nn.Module):
             "view_topology_candidate_mode": self.view_topology_candidate_mode,
             "view_topology_view_candidates": self.view_topology_view_candidates,
             "coview_feature_mode": self.coview_feature_mode,
-            "use_causal_coview_feature": self.causal_coview_enabled,
+            "use_causal_coview_feature": self.causal_feature_enabled,
+            "use_causal_coview_scaling": self.causal_scaling_enabled,
             "causal_coview_groups": getattr(self, "causal_coview_groups", 4),
             "causal_coview_candidates": getattr(
                 self, "causal_coview_candidates", 32
@@ -1132,6 +1255,7 @@ class GaussianModel(nn.Module):
                 "view_topology_candidate_mode": "spatial",
                 "view_topology_view_candidates": 16,
                 "use_causal_coview_feature": False,
+                "use_causal_coview_scaling": False,
                 "causal_coview_groups": 4,
                 "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
@@ -1139,6 +1263,7 @@ class GaussianModel(nn.Module):
             saved_value = architecture.get(key, legacy_defaults.get(key))
             if branching_to_causal and key in {
                 "use_causal_coview_feature",
+                "use_causal_coview_scaling",
                 "causal_coview_groups",
                 "causal_coview_candidates",
                 "causal_coview_max_weight",
@@ -1178,7 +1303,10 @@ class GaussianModel(nn.Module):
         if branching_to_causal:
             current_optimizer_state = self.optimizer.state_dict()
             saved_group_count = len(optimizer_state["param_groups"])
-            if saved_group_count + 1 != len(current_optimizer_state["param_groups"]):
+            if (
+                saved_group_count + branching_group_count
+                != len(current_optimizer_state["param_groups"])
+            ):
                 raise RuntimeError(
                     "cannot branch checkpoint to causal CoView: unexpected "
                     "optimizer parameter-group layout"
@@ -1186,7 +1314,9 @@ class GaussianModel(nn.Module):
             optimizer_state = {
                 "state": optimizer_state["state"],
                 "param_groups": list(optimizer_state["param_groups"]) + [
-                    current_optimizer_state["param_groups"][-1]
+                    *current_optimizer_state["param_groups"][
+                        -branching_group_count:
+                    ]
                 ],
             }
         self.optimizer.load_state_dict(optimizer_state)
@@ -1404,11 +1534,17 @@ class GaussianModel(nn.Module):
                 'lr': training_args.mlp_coview_lr_init,
                 "name": "mlp_coview",
             })
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             l.append({
                 'params': list(self.causal_coview_feature_prior.parameters()),
                 'lr': training_args.mlp_coview_lr_init,
                 "name": "causal_coview_feature",
+            })
+        if self.causal_scaling_enabled:
+            l.append({
+                'params': list(self.causal_coview_scaling_prior.parameters()),
+                'lr': training_args.mlp_coview_lr_init,
+                "name": "causal_coview_scaling",
             })
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -1513,6 +1649,9 @@ class GaussianModel(nn.Module):
                 lr = self.mlp_coview_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "causal_coview_feature":
+                lr = self.mlp_coview_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "causal_coview_scaling":
                 lr = self.mlp_coview_scheduler_args(iteration)
                 param_group['lr'] = lr
 
@@ -1882,16 +2021,22 @@ class GaussianModel(nn.Module):
                 'coview_offset_head': self.mlp_coview_offset.state_dict(),
                 'coview_gates': self.coview_gates.state_dict(),
             })
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             checkpoint.update({
-                'use_causal_coview_feature': True,
+                'use_causal_coview_feature': self.causal_feature_enabled,
+                'use_causal_coview_scaling': self.causal_scaling_enabled,
                 'causal_coview_groups': self.causal_coview_groups,
                 'causal_coview_candidates': self.causal_coview_candidates,
                 'causal_coview_max_weight': self.causal_coview_max_weight,
-                'causal_coview_feature_prior': (
-                    self.causal_coview_feature_prior.state_dict()
-                ),
             })
+            if self.causal_feature_enabled:
+                checkpoint['causal_coview_feature_prior'] = (
+                    self.causal_coview_feature_prior.state_dict()
+                )
+            if self.causal_scaling_enabled:
+                checkpoint['causal_coview_scaling_prior'] = (
+                    self.causal_coview_scaling_prior.state_dict()
+                )
         torch.save(checkpoint, path)
 
 
@@ -1901,6 +2046,7 @@ class GaussianModel(nn.Module):
         load_coview_feature_head=True,
         validate_topology_config=True,
         load_causal_feature_prior=True,
+        load_causal_scaling_prior=True,
     ):
         checkpoint = torch.load(path)
         self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
@@ -1949,9 +2095,10 @@ class GaussianModel(nn.Module):
             self.mlp_coview_scaling.load_state_dict(checkpoint['coview_scaling_head'])
             self.mlp_coview_offset.load_state_dict(checkpoint['coview_offset_head'])
             self.coview_gates.load_state_dict(checkpoint['coview_gates'])
-        if self.causal_coview_enabled and load_causal_feature_prior:
-            if not checkpoint.get('use_causal_coview_feature', False):
-                raise KeyError("checkpoint is missing causal CoView Feature state")
+        if (
+            (self.causal_feature_enabled and load_causal_feature_prior)
+            or (self.causal_scaling_enabled and load_causal_scaling_prior)
+        ):
             expected = {
                 'causal_coview_groups': self.causal_coview_groups,
                 'causal_coview_candidates': self.causal_coview_candidates,
@@ -1963,8 +2110,17 @@ class GaussianModel(nn.Module):
                         f"causal CoView checkpoint {key} mismatch: "
                         f"{checkpoint.get(key)!r} != {value!r}"
                     )
+        if self.causal_feature_enabled and load_causal_feature_prior:
+            if not checkpoint.get('use_causal_coview_feature', False):
+                raise KeyError("checkpoint is missing causal CoView Feature state")
             self.causal_coview_feature_prior.load_state_dict(
                 checkpoint['causal_coview_feature_prior']
+            )
+        if self.causal_scaling_enabled and load_causal_scaling_prior:
+            if not checkpoint.get('use_causal_coview_scaling', False):
+                raise KeyError("checkpoint is missing causal CoView Scaling state")
+            self.causal_coview_scaling_prior.load_state_dict(
+                checkpoint['causal_coview_scaling_prior']
             )
 
     def contract_to_unisphere(self,
@@ -2046,7 +2202,7 @@ class GaussianModel(nn.Module):
         offsets = offsets.view(-1, 3*self.n_offsets)
         mask_tmp = _mask.repeat(1, 1, 3).view(-1, 3*self.n_offsets)
 
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             neighbors = causal_graph.neighbors.to(_feat.device)
             weights = causal_graph.weights.to(_feat.device)
             support = causal_graph.support.to(_feat.device)
@@ -2088,7 +2244,38 @@ class GaussianModel(nn.Module):
                                                 probs[..., 0], probs[..., 1],
                                                 Q=Q_feat)
 
-        bit_scaling = self.entropy_gaussian.forward(grid_scaling, mean_scaling, scale_scaling, Q_scaling)
+        if self.causal_scaling_enabled:
+            neighbors = causal_graph.neighbors.to(grid_scaling.device)
+            weights = causal_graph.weights.to(grid_scaling.device)
+            support = causal_graph.support.to(grid_scaling.device)
+            scaling_neighbor_mean, scaling_neighbor_std = (
+                causal_neighbor_statistics(grid_scaling, neighbors, weights)
+            )
+            scaling_q = Q_scaling.expand_as(grid_scaling).contiguous()
+            causal_scaling_mean, causal_scaling_scale, causal_scaling_weight = (
+                self.causal_coview_scaling_prior(
+                    mean_scaling,
+                    torch.clamp(scale_scaling, min=1e-9),
+                    scaling_q,
+                    scaling_neighbor_mean,
+                    scaling_neighbor_std,
+                    support,
+                )
+            )
+            causal_scaling_weight = torch.clamp(
+                causal_scaling_weight, min=0.0, max=1.0 - 1e-6
+            )
+            bit_scaling = self.EG_mix_prob_2.forward(
+                grid_scaling,
+                mean_scaling, causal_scaling_mean,
+                scale_scaling, causal_scaling_scale,
+                1.0 - causal_scaling_weight, causal_scaling_weight,
+                Q=scaling_q,
+            )
+        else:
+            bit_scaling = self.entropy_gaussian.forward(
+                grid_scaling, mean_scaling, scale_scaling, Q_scaling
+            )
         bit_offsets = self.entropy_gaussian.forward(offsets, mean_offsets, scale_offsets, Q_offsets)
         bit_offsets = bit_offsets * mask_tmp
 
@@ -2174,6 +2361,7 @@ class GaussianModel(nn.Module):
             'coview_target': self.coview_target,
             'coview_feature_mode': self.coview_feature_mode,
             'use_causal_coview_feature': self.use_causal_coview_feature,
+            'use_causal_coview_scaling': self.use_causal_coview_scaling,
             'causal_coview_groups': self.causal_coview_groups,
             'causal_coview_candidates': self.causal_coview_candidates,
             'causal_coview_max_weight': self.causal_coview_max_weight,
@@ -2236,7 +2424,7 @@ class GaussianModel(nn.Module):
         bit_scaling_list = []
         bit_offsets_list = []
 
-        if self.causal_coview_enabled:
+        if self.causal_feature_enabled:
             t_feature_0 = get_time()
             q_feature_all = torch.cat([
                 self.feature_quantization_steps(_anchor[start:start + MAX_batch_size])
@@ -2267,6 +2455,42 @@ class GaussianModel(nn.Module):
             )
             bit_feat_list.append(causal_result['coder_bits'])
             t_feature += get_time() - t_feature_0
+
+        if self.causal_scaling_enabled:
+            t_scaling_0 = get_time()
+            q_scaling_all = torch.cat([
+                self.scaling_quantization_steps(
+                    _anchor[start:start + MAX_batch_size]
+                )
+                for start in range(0, N, MAX_batch_size)
+            ], dim=0)
+            causal_scaling_symbols = STE_multistep.apply(
+                _scaling, q_scaling_all, self.get_scaling.mean()
+            )
+            entropy_context['causal_scaling_symbol_index_checksum'] = (
+                self._view_topology_checksum(
+                    torch.round(
+                        causal_scaling_symbols / q_scaling_all
+                    ).to(torch.int32)
+                )
+            )
+            torch.save(
+                entropy_context,
+                os.path.join(pre_path_name, 'entropy_context.pth'),
+            )
+            causal_scaling_result = encode_causal_scaling_symbols(
+                self,
+                self.causal_coview_scaling_prior,
+                causal_scaling_symbols,
+                q_scaling_all,
+                _anchor,
+                causal_graph,
+                pre_path_name,
+                batch_size=MAX_batch_size,
+                topology_features=topology_features,
+            )
+            bit_scaling_list.append(causal_scaling_result['coder_bits'])
+            t_scaling += get_time() - t_scaling_0
 
         hash_b_name = os.path.join(pre_path_name, 'hash.b')
         masks_b_name = os.path.join(pre_path_name, 'masks.b')
@@ -2311,7 +2535,7 @@ class GaussianModel(nn.Module):
             Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
             Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
 
-            if not self.causal_coview_enabled:
+            if not self.causal_feature_enabled:
                 feat = _feat[N_start:N_end]
                 feat = STE_multistep.apply(feat, Q_feat, self._anchor_feat.mean())
                 torch.cuda.synchronize(); t0 = time.time()
@@ -2340,14 +2564,15 @@ class GaussianModel(nn.Module):
                 torch.cuda.synchronize(); t_codec += time.time() - t0
                 bit_feat_list.append(bit_feat)
 
-            t_scaling_0 = get_time()
-            scaling = _scaling[N_start:N_end].view(-1)  # [N_num*6]
-            scaling = STE_multistep.apply(scaling, Q_scaling, self.get_scaling.mean())
-            torch.cuda.synchronize(); t0 = time.time()
-            bit_scaling = encoder_gaussian_chunk(scaling, mean_scaling, scale_scaling, Q_scaling, file_name=scaling_b_name, chunk_size=10_0000)
-            torch.cuda.synchronize(); t_codec += time.time() - t0
-            bit_scaling_list.append(bit_scaling)
-            t_scaling += get_time() - t_scaling_0
+            if not self.causal_scaling_enabled:
+                t_scaling_0 = get_time()
+                scaling = _scaling[N_start:N_end].view(-1)  # [N_num*6]
+                scaling = STE_multistep.apply(scaling, Q_scaling, self.get_scaling.mean())
+                torch.cuda.synchronize(); t0 = time.time()
+                bit_scaling = encoder_gaussian_chunk(scaling, mean_scaling, scale_scaling, Q_scaling, file_name=scaling_b_name, chunk_size=10_0000)
+                torch.cuda.synchronize(); t_codec += time.time() - t0
+                bit_scaling_list.append(bit_scaling)
+                t_scaling += get_time() - t_scaling_0
 
             t_offset_0 = get_time()
             mask = _mask[N_start:N_end]  # {0, 1}  # [N_num, K, 1]
@@ -2444,6 +2669,7 @@ class GaussianModel(nn.Module):
             'coview_target': self.coview_target,
             'coview_feature_mode': self.coview_feature_mode,
             'use_causal_coview_feature': self.use_causal_coview_feature,
+            'use_causal_coview_scaling': self.use_causal_coview_scaling,
             'causal_coview_groups': self.causal_coview_groups,
             'causal_coview_candidates': self.causal_coview_candidates,
             'causal_coview_max_weight': self.causal_coview_max_weight,
@@ -2458,6 +2684,7 @@ class GaussianModel(nn.Module):
                 "view_topology_candidate_mode": "spatial",
                 "view_topology_view_candidates": 16,
                 "use_causal_coview_feature": False,
+                "use_causal_coview_scaling": False,
                 "causal_coview_groups": 4,
                 "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
@@ -2559,6 +2786,7 @@ class GaussianModel(nn.Module):
 
         causal_graph = None
         causal_feat_decoded = None
+        causal_scaling_decoded = None
         if self.causal_coview_enabled:
             causal_graph, causal_diagnostics = self.codec_causal_graph(anchor_decoded)
             expected_diagnostics = entropy_context['causal_graph_diagnostics']
@@ -2571,6 +2799,8 @@ class GaussianModel(nn.Module):
                     f"{causal_diagnostics['graph_checksum']} != "
                     f"{expected_diagnostics['graph_checksum']}"
                 )
+
+        if self.causal_feature_enabled:
             q_feature_all = torch.cat([
                 self.feature_quantization_steps(
                     anchor_decoded[start:start + MAX_batch_size]
@@ -2601,6 +2831,40 @@ class GaussianModel(nn.Module):
                     f"{expected_symbol_index_checksum}"
                 )
             t_feature += get_time() - t_feature_0
+
+        if self.causal_scaling_enabled:
+            q_scaling_all = torch.cat([
+                self.scaling_quantization_steps(
+                    anchor_decoded[start:start + MAX_batch_size]
+                )
+                for start in range(0, N, MAX_batch_size)
+            ], dim=0)
+            t_scaling_0 = get_time()
+            causal_scaling_decoded = decode_causal_scaling_symbols(
+                self,
+                self.causal_coview_scaling_prior,
+                q_scaling_all,
+                anchor_decoded,
+                causal_graph,
+                pre_path_name,
+                batch_size=MAX_batch_size,
+                topology_features=topology_features,
+            )
+            decoded_scaling_checksum = self._view_topology_checksum(
+                torch.round(
+                    causal_scaling_decoded / q_scaling_all
+                ).to(torch.int32)
+            )
+            expected_scaling_checksum = entropy_context[
+                'causal_scaling_symbol_index_checksum'
+            ]
+            if decoded_scaling_checksum != expected_scaling_checksum:
+                raise RuntimeError(
+                    "causal Scaling symbol-index checksum mismatch: "
+                    f"{decoded_scaling_checksum} != "
+                    f"{expected_scaling_checksum}"
+                )
+            t_scaling += get_time() - t_scaling_0
 
         for s in range(steps):
 
@@ -2644,7 +2908,7 @@ class GaussianModel(nn.Module):
             Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
             Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
 
-            if self.causal_coview_enabled:
+            if self.causal_feature_enabled:
                 feat_decoded = causal_feat_decoded[N_start:N_end]
             else:
                 t_feature_0 = get_time()
@@ -2669,11 +2933,14 @@ class GaussianModel(nn.Module):
                 t_feature += get_time() - t_feature_0
             feat_decoded_list.append(feat_decoded)
 
-            t_scaling_0 = get_time()
-            scaling_decoded = decoder_gaussian_chunk(mean_scaling, scale_scaling, Q_scaling, file_name=scaling_b_name, chunk_size=10_0000)
-            scaling_decoded = scaling_decoded.view(N_num, 6)  # [N_num, 6]
+            if self.causal_scaling_enabled:
+                scaling_decoded = causal_scaling_decoded[N_start:N_end]
+            else:
+                t_scaling_0 = get_time()
+                scaling_decoded = decoder_gaussian_chunk(mean_scaling, scale_scaling, Q_scaling, file_name=scaling_b_name, chunk_size=10_0000)
+                scaling_decoded = scaling_decoded.view(N_num, 6)  # [N_num, 6]
+                t_scaling += get_time() - t_scaling_0
             scaling_decoded_list.append(scaling_decoded)
-            t_scaling += get_time() - t_scaling_0
 
             t_offset_0 = get_time()
             masks_tmp = masks_decoded[N_start:N_end].repeat(1, 1, 3).view(-1, 3 * self.n_offsets).view(-1).to(torch.bool)

@@ -63,6 +63,7 @@ class ModelParams(ParamGroup):
         self.coview_target = "none"
         self.coview_feature_mode = "full"
         self.use_causal_coview_feature = False
+        self.use_causal_coview_scaling = False
         self.causal_coview_groups = 4
         self.causal_coview_candidates = 32
         self.causal_coview_max_weight = 0.25

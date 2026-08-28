@@ -46,6 +46,7 @@ def main():
     )
     parser.add_argument("--view_topology_view_candidates", type=int, default=16)
     parser.add_argument("--use_causal_coview_feature", action="store_true")
+    parser.add_argument("--use_causal_coview_scaling", action="store_true")
     parser.add_argument("--causal_coview_groups", type=int, default=4)
     parser.add_argument("--causal_coview_candidates", type=int, default=32)
     parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
@@ -77,6 +78,7 @@ def main():
         coview_target=args.coview_target,
         coview_feature_mode=args.coview_feature_mode,
         use_causal_coview_feature=args.use_causal_coview_feature,
+        use_causal_coview_scaling=args.use_causal_coview_scaling,
         causal_coview_groups=args.causal_coview_groups,
         causal_coview_candidates=args.causal_coview_candidates,
         causal_coview_max_weight=args.causal_coview_max_weight,
@@ -91,7 +93,7 @@ def main():
         load_causal_feature_prior=not bool(args.causal_prior),
     )
     if args.causal_prior:
-        if not model.causal_coview_enabled:
+        if not model.causal_feature_enabled:
             raise ValueError("--causal_prior requires --use_causal_coview_feature")
         causal_state, _ = deserialize_named_tensors(args.causal_prior)
         expected = set(model.causal_coview_feature_prior.state_dict())
@@ -121,6 +123,7 @@ def main():
     print(json.dumps({
         "coview_target": args.coview_target,
         "use_causal_coview_feature": args.use_causal_coview_feature,
+        "use_causal_coview_scaling": args.use_causal_coview_scaling,
         "coview_serialization": args.coview_serialization,
         "encode_log": log,
     }))

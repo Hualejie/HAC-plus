@@ -303,6 +303,62 @@ class AffineCausalFeaturePrior(nn.Module):
         )
 
 
+class AffineCausalScalingPrior(nn.Module):
+    """Per-channel affine expert for six decoded Scaling values."""
+
+    CHANNELS = 6
+
+    def __init__(self, max_mixture_weight: float = 0.25):
+        super().__init__()
+        if not 0.0 < max_mixture_weight <= 1.0:
+            raise ValueError("max_mixture_weight must be in (0, 1]")
+        self.max_mixture_weight = float(max_mixture_weight)
+        self.mean_blend = nn.Parameter(torch.zeros(self.CHANNELS))
+        self.log_scale_blend = nn.Parameter(torch.zeros(self.CHANNELS))
+        self.gate_logit = nn.Parameter(torch.full((self.CHANNELS,), -8.0))
+
+    def forward(
+        self,
+        base_mean,
+        base_scale,
+        q_scaling,
+        neighbor_mean,
+        neighbor_std,
+        support,
+    ):
+        expected = (base_mean.shape[0], self.CHANNELS)
+        for name, value in (
+            ("base_mean", base_mean),
+            ("base_scale", base_scale),
+            ("q_scaling", q_scaling),
+            ("neighbor_mean", neighbor_mean),
+            ("neighbor_std", neighbor_std),
+        ):
+            if value.shape != expected:
+                raise ValueError(f"{name} must have shape {expected}")
+        if support.shape != (base_mean.shape[0], 1):
+            raise ValueError("support must have shape [N, 1]")
+        beta = torch.tanh(self.mean_blend)[None, :]
+        causal_mean = base_mean + beta * (neighbor_mean - base_mean)
+        relative_std = torch.log(torch.clamp(
+            (neighbor_std + 0.5 * q_scaling)
+            / torch.clamp(base_scale, min=1e-9),
+            min=1e-6,
+            max=1e6,
+        ))
+        causal_scale = torch.clamp(base_scale, min=1e-9) * torch.exp(
+            torch.clamp(
+                self.log_scale_blend[None, :] * relative_std,
+                min=-5.0,
+                max=5.0,
+            )
+        )
+        gate = self.max_mixture_weight * torch.sigmoid(
+            self.gate_logit
+        )[None, :]
+        return causal_mean, causal_scale, gate * support
+
+
 def mixture_moments(means, scales, probabilities):
     """Moment-match a Gaussian mixture for the causal expert reference."""
     mixture_mean = sum(
@@ -400,6 +456,49 @@ def causal_feature_components(
             base_probabilities[..., 1] * base_mass,
             causal_weight,
         ),
+    )
+
+
+def causal_scaling_components(
+    model,
+    causal_prior,
+    q_scaling,
+    anchors,
+    neighbor_mean,
+    neighbor_std,
+    support,
+    topology_features=None,
+):
+    """Build the HAC++ Scaling prior plus one causal decoded-neighbour prior."""
+    outputs = torch.split(
+        model.get_grid_mlp(model.calc_interp_feat(anchors)),
+        [
+            model.feat_dim, model.feat_dim, model.feat_dim,
+            6, 6, 3 * model.n_offsets, 3 * model.n_offsets,
+            1, 1, 1,
+        ],
+        dim=-1,
+    )
+    mean_scaling, scale_scaling = outputs[3], outputs[4]
+    if model.coview_enabled:
+        mean_scaling, scale_scaling = model.apply_coview_entropy_context(
+            mean_scaling, scale_scaling, topology_features, "scaling"
+        )
+    scale_scaling = torch.clamp(scale_scaling, min=1e-9)
+    causal_mean, causal_scale, causal_weight = causal_prior(
+        mean_scaling,
+        scale_scaling,
+        q_scaling,
+        neighbor_mean,
+        neighbor_std,
+        support,
+    )
+    causal_weight = torch.clamp(causal_weight, min=0.0, max=1.0 - 1e-6)
+    return (
+        (mean_scaling, causal_mean),
+        (scale_scaling, torch.clamp(causal_scale, min=1e-9)),
+        (1.0 - causal_weight, causal_weight),
+        q_scaling,
     )
 
 
@@ -541,4 +640,133 @@ def decode_causal_feature_symbols(
                     indices.numel(), FEATURE_CHUNK_DIM
                 )
             decoded[indices] = batch_decoded
+    return decoded
+
+
+@torch.no_grad()
+def encode_causal_scaling_symbols(
+    model,
+    causal_prior,
+    symbols,
+    q_scaling,
+    anchors,
+    graph,
+    output,
+    batch_size=3000,
+    topology_features=None,
+):
+    """Encode canonical Scaling symbols using only earlier coding groups."""
+    from utils.encodings_cuda import encoder_gaussian_mixed_chunk
+
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    neighbors = graph.neighbors.to(symbols.device)
+    weights = graph.weights.to(symbols.device)
+    support = graph.support.to(symbols.device)
+    groups = graph.groups.to(symbols.device)
+    bit_count = 0
+    quantized = torch.zeros_like(symbols)
+    for group in range(graph.diagnostics["num_groups"]):
+        group_indices = torch.nonzero(groups == group, as_tuple=False)[:, 0]
+        for batch_index, start in enumerate(
+            range(0, group_indices.numel(), batch_size)
+        ):
+            indices = group_indices[start:start + batch_size]
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                quantized, neighbors, weights, indices
+            )
+            batch_topology = (
+                None if topology_features is None else topology_features[indices]
+            )
+            means, scales, probabilities, batch_q = causal_scaling_components(
+                model,
+                causal_prior,
+                q_scaling[indices],
+                anchors[indices],
+                neighbor_mean,
+                neighbor_std,
+                support[indices],
+                topology_features=batch_topology,
+            )
+            batch_symbols = symbols[indices]
+            file_name = output / (
+                f"scaling_group{group}_batch{batch_index}.b"
+            )
+            bit_count += encoder_gaussian_mixed_chunk(
+                batch_symbols.contiguous().view(-1),
+                [value.contiguous().view(-1) for value in means],
+                [value.contiguous().view(-1) for value in scales],
+                [value.contiguous().view(-1) for value in probabilities],
+                batch_q.contiguous().view(-1),
+                file_name=str(file_name),
+                chunk_size=100_000,
+            )
+            quantized[indices] = batch_symbols
+    stream_bytes = sum(
+        path.stat().st_size
+        for path in output.glob("scaling_group*_batch*.b")
+    )
+    return {
+        "coder_bits": bit_count,
+        "stream_bytes": stream_bytes,
+        "quantized": quantized,
+    }
+
+
+@torch.no_grad()
+def decode_causal_scaling_symbols(
+    model,
+    causal_prior,
+    q_scaling,
+    anchors,
+    graph,
+    stream,
+    batch_size=3000,
+    topology_features=None,
+):
+    """Decode Scaling without reading same- or future-group symbols."""
+    from utils.encodings_cuda import decoder_gaussian_mixed_chunk
+
+    stream = Path(stream)
+    decoded = torch.zeros(
+        anchors.shape[0], 6, dtype=torch.float32, device=anchors.device
+    )
+    neighbors = graph.neighbors.to(anchors.device)
+    weights = graph.weights.to(anchors.device)
+    support = graph.support.to(anchors.device)
+    groups = graph.groups.to(anchors.device)
+    for group in range(graph.diagnostics["num_groups"]):
+        group_indices = torch.nonzero(groups == group, as_tuple=False)[:, 0]
+        for batch_index, start in enumerate(
+            range(0, group_indices.numel(), batch_size)
+        ):
+            indices = group_indices[start:start + batch_size]
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                decoded, neighbors, weights, indices
+            )
+            batch_topology = (
+                None if topology_features is None else topology_features[indices]
+            )
+            means, scales, probabilities, batch_q = causal_scaling_components(
+                model,
+                causal_prior,
+                q_scaling[indices],
+                anchors[indices],
+                neighbor_mean,
+                neighbor_std,
+                support[indices],
+                topology_features=batch_topology,
+            )
+            file_name = stream / (
+                f"scaling_group{group}_batch{batch_index}.b"
+            )
+            values = decoder_gaussian_mixed_chunk(
+                [value.contiguous().view(-1) for value in means],
+                [value.contiguous().view(-1) for value in scales],
+                [value.contiguous().view(-1) for value in probabilities],
+                batch_q.contiguous().view(-1),
+                file_name=str(file_name),
+                chunk_size=100_000,
+            )
+            decoded[indices] = values.view(indices.numel(), 6)
     return decoded

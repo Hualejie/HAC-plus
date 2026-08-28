@@ -58,6 +58,7 @@ def main():
         coview_target=dataset.coview_target,
         coview_feature_mode=dataset.coview_feature_mode,
         use_causal_coview_feature=dataset.use_causal_coview_feature,
+        use_causal_coview_scaling=dataset.use_causal_coview_scaling,
         causal_coview_groups=dataset.causal_coview_groups,
         causal_coview_candidates=dataset.causal_coview_candidates,
         causal_coview_max_weight=dataset.causal_coview_max_weight,

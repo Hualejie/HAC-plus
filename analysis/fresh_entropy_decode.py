@@ -49,6 +49,7 @@ def main():
     )
     parser.add_argument("--view_topology_view_candidates", type=int, default=16)
     parser.add_argument("--use_causal_coview_feature", action="store_true")
+    parser.add_argument("--use_causal_coview_scaling", action="store_true")
     parser.add_argument("--causal_coview_groups", type=int, default=4)
     parser.add_argument("--causal_coview_candidates", type=int, default=32)
     parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
@@ -69,6 +70,7 @@ def main():
         coview_target=args.coview_target,
         coview_feature_mode=args.coview_feature_mode,
         use_causal_coview_feature=args.use_causal_coview_feature,
+        use_causal_coview_scaling=args.use_causal_coview_scaling,
         causal_coview_groups=args.causal_coview_groups,
         causal_coview_candidates=args.causal_coview_candidates,
         causal_coview_max_weight=args.causal_coview_max_weight,
@@ -80,7 +82,7 @@ def main():
     model.eval()
     log = model.conduct_decoding(os.path.abspath(args.bitstream))
     feature_symbol_index_checksum = None
-    if model.causal_coview_enabled:
+    if model.causal_feature_enabled:
         q_feature = torch.cat([
             model.feature_quantization_steps(
                 model._anchor[start:start + 3000]
@@ -90,13 +92,26 @@ def main():
         feature_symbol_index_checksum = _checksum(
             torch.round(model._anchor_feat / q_feature).to(torch.int32)
         )
+    scaling_symbol_index_checksum = None
+    if model.causal_scaling_enabled:
+        q_scaling = torch.cat([
+            model.scaling_quantization_steps(
+                model._anchor[start:start + 3000]
+            )
+            for start in range(0, model._anchor.shape[0], 3000)
+        ], dim=0)
+        scaling_symbol_index_checksum = _checksum(
+            torch.round(model._scaling / q_scaling).to(torch.int32)
+        )
     result = {
         "coview_target": args.coview_target,
         "use_causal_coview_feature": args.use_causal_coview_feature,
+        "use_causal_coview_scaling": args.use_causal_coview_scaling,
         "num_anchors": int(model._anchor.shape[0]),
         "anchor_checksum": _checksum(model._anchor),
         "feature_checksum": _checksum(model._anchor_feat),
         "feature_symbol_index_checksum": feature_symbol_index_checksum,
+        "scaling_symbol_index_checksum": scaling_symbol_index_checksum,
         "scaling_checksum": _checksum(model._scaling),
         "offset_checksum": _checksum(model._offset),
         "mask_checksum": _checksum(model._mask),

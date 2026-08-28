@@ -110,7 +110,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
             binary_grid_masks_chosen = binary_grid_masks_chosen.repeat(1, 1, 3).view(-1, 3*pc.n_offsets)
 
-            if pc.causal_coview_enabled and pc._training_causal_graph is not None:
+            if pc.causal_feature_enabled and pc._training_causal_graph is not None:
                 neighbor_mean, neighbor_std, causal_support = (
                     pc.training_causal_feature_statistics(choose_idx)
                 )
@@ -153,7 +153,36 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
                                                     probs[..., 0], probs[..., 1],
                                                     Q=Q_feat, x_mean=pc._anchor_feat.mean())
             bit_feat = bit_feat * mask_anchor_chosen
-            bit_scaling = pc.entropy_gaussian.forward(grid_scaling_chosen, mean_scaling, scale_scaling, Q_scaling, pc.get_scaling.mean())
+            if pc.causal_scaling_enabled and pc._training_causal_graph is not None:
+                scaling_neighbor_mean, scaling_neighbor_std, scaling_support = (
+                    pc.training_causal_scaling_statistics(choose_idx)
+                )
+                causal_scaling_mean, causal_scaling_scale, causal_scaling_weight = (
+                    pc.causal_coview_scaling_prior(
+                        mean_scaling,
+                        torch.clamp(scale_scaling, min=1e-9),
+                        Q_scaling,
+                        scaling_neighbor_mean,
+                        scaling_neighbor_std,
+                        scaling_support,
+                    )
+                )
+                causal_scaling_weight = torch.clamp(
+                    causal_scaling_weight, min=0.0, max=1.0 - 1e-6
+                )
+                bit_scaling = pc.EG_mix_prob_2.forward(
+                    grid_scaling_chosen,
+                    mean_scaling, causal_scaling_mean,
+                    scale_scaling, causal_scaling_scale,
+                    1.0 - causal_scaling_weight, causal_scaling_weight,
+                    Q=Q_scaling,
+                    x_mean=pc.get_scaling.mean(),
+                )
+            else:
+                bit_scaling = pc.entropy_gaussian.forward(
+                    grid_scaling_chosen, mean_scaling, scale_scaling,
+                    Q_scaling, pc.get_scaling.mean()
+                )
             bit_scaling = bit_scaling * mask_anchor_chosen
             bit_offsets = pc.entropy_gaussian.forward(grid_offsets_chosen, mean_offsets, scale_offsets, Q_offsets.view(-1, 3*pc.n_offsets), pc._offset.mean())
             bit_offsets = bit_offsets * mask_anchor_chosen * binary_grid_masks_chosen

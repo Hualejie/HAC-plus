@@ -3,6 +3,7 @@ import torch
 
 from scene.coview_causal_context import (
     AffineCausalFeaturePrior,
+    AffineCausalScalingPrior,
     CausalFeaturePrior,
     build_causal_anchor_graph,
     causal_neighbor_statistics,
@@ -121,3 +122,27 @@ def test_affine_prior_uses_only_fifteen_parameters_and_chunk_identity():
     )
     assert all(value.shape == (2, 10) for value in output)
     assert torch.all(output[2][0] == 0)
+
+
+def test_affine_scaling_prior_is_small_and_support_gated():
+    prior = AffineCausalScalingPrior()
+    assert sum(parameter.numel() for parameter in prior.parameters()) == 18
+    base_mean = torch.zeros(2, 6)
+    base_scale = torch.ones(2, 6)
+    q_scaling = torch.full((2, 6), 0.001)
+    neighbor_mean = torch.full((2, 6), 0.25)
+    neighbor_std = torch.full((2, 6), 0.5)
+    support = torch.tensor([[0.0], [0.75]])
+
+    mean, scale, weight = prior(
+        base_mean,
+        base_scale,
+        q_scaling,
+        neighbor_mean,
+        neighbor_std,
+        support,
+    )
+    assert mean.shape == scale.shape == weight.shape == (2, 6)
+    assert torch.all(weight[0] == 0)
+    assert torch.all(weight[1] > 0)
+    assert torch.all(weight <= 0.25)
