@@ -101,6 +101,40 @@ def optimize_prior(model, prior, fixed, graph, schedule, args):
     support = graph.support.to(fixed["symbols"].device)
     losses = []
     started = time.time()
+    validation_indices = torch.as_tensor(
+        args.validation_indices, device="cuda", dtype=torch.long
+    )
+
+    @torch.no_grad()
+    def validation_bps():
+        values = []
+        for start in range(0, validation_indices.numel(), args.batch_size):
+            indices = validation_indices[start:start + args.batch_size]
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                fixed["symbols"], neighbors, weights, indices
+            )
+            bits = causal_feature_rate_bits(
+                model,
+                prior,
+                fixed["symbols"][indices],
+                fixed["q_feature"][indices],
+                fixed["anchors"][indices],
+                neighbor_mean,
+                neighbor_std,
+                support[indices],
+            )
+            values.append(float(bits.cpu()))
+        return sum(values) / validation_indices.numel() / model.feat_dim
+
+    prior.eval()
+    initial_validation_bps = validation_bps()
+    best_validation_bps = initial_validation_bps
+    best_step = 0
+    best_state = {
+        name: value.detach().cpu().clone()
+        for name, value in prior.state_dict().items()
+    }
+    prior.train()
     for step, cpu_indices in enumerate(schedule):
         indices = torch.as_tensor(cpu_indices, device="cuda", dtype=torch.long)
         with torch.no_grad():
@@ -123,16 +157,35 @@ def optimize_prior(model, prior, fixed, graph, schedule, args):
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
         if step == 0 or (step + 1) % args.log_interval == 0:
+            prior.eval()
+            current_validation_bps = validation_bps()
+            if current_validation_bps < best_validation_bps:
+                best_validation_bps = current_validation_bps
+                best_step = step + 1
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in prior.state_dict().items()
+                }
             print(json.dumps({
                 "step": step + 1,
                 "steps": len(schedule),
                 "bits_per_symbol": losses[-1],
+                "validation_bits_per_symbol": current_validation_bps,
+                "best_validation_bits_per_symbol": best_validation_bps,
             }), flush=True)
+            prior.train()
+    prior.load_state_dict({
+        name: value.to(next(prior.parameters()).device)
+        for name, value in best_state.items()
+    })
     prior.eval()
     return {
         "training_seconds": time.time() - started,
         "initial_sample_bps": losses[0],
         "final_sample_bps": losses[-1],
+        "initial_validation_bps": initial_validation_bps,
+        "best_validation_bps": best_validation_bps,
+        "best_step": best_step,
     }
 
 
@@ -149,6 +202,8 @@ def main():
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--causal_groups", type=int, default=4)
     parser.add_argument("--causal_hidden_dim", type=int, default=16)
+    parser.add_argument("--causal_max_mixture_weight", type=float, default=0.25)
+    parser.add_argument("--validation_size", type=int, default=12000)
     parser.add_argument("--feat_dim", type=int, default=50)
     parser.add_argument("--n_offsets", type=int, default=10)
     parser.add_argument("--voxel_size", type=float, default=0.005)
@@ -188,11 +243,18 @@ def main():
     graph = build_causal_anchor_graph(topology, num_groups=args.causal_groups)
 
     rng = np.random.default_rng(args.seed)
-    schedule = rng.integers(
-        0, fixed["anchors"].shape[0],
+    permutation = rng.permutation(fixed["anchors"].shape[0]).astype(np.int32)
+    validation_size = min(args.validation_size, permutation.size // 4)
+    args.validation_indices = permutation[:validation_size]
+    train_pool = permutation[validation_size:]
+    schedule = train_pool[rng.integers(
+        0, train_pool.size,
         size=(args.steps, args.batch_size), dtype=np.int32,
-    )
-    prior = CausalFeaturePrior(args.causal_hidden_dim).cuda()
+    )]
+    prior = CausalFeaturePrior(
+        args.causal_hidden_dim,
+        max_mixture_weight=args.causal_max_mixture_weight,
+    ).cuda()
     training_metrics = optimize_prior(model, prior, fixed, graph, schedule, args)
 
     model_path = output / "causal_feature_model.bin"
@@ -236,6 +298,7 @@ def main():
             "view_topology_view_candidates": args.view_topology_view_candidates,
             "causal_groups": args.causal_groups,
             "causal_hidden_dim": args.causal_hidden_dim,
+            "causal_max_mixture_weight": args.causal_max_mixture_weight,
             "n_features": args.n_features,
             "log2": args.log2,
             "log2_2D": args.log2_2D,

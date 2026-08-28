@@ -86,7 +86,7 @@ def test_causal_feature_prior_preserves_5x10_shapes_and_zero_support():
     assert mean.shape == scale.shape == weight.shape == (2, 50)
     assert torch.all(weight[0] == 0)
     assert torch.all(weight[1] > 0)
-    assert torch.all(weight < 1)
+    assert torch.all(weight <= 0.25)
     for chunk in range(5):
         chunk_weight = weight[:, chunk * 10:(chunk + 1) * 10]
         torch.testing.assert_close(

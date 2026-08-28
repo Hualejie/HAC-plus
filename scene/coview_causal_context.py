@@ -113,8 +113,11 @@ def causal_neighbor_statistics(
 class CausalFeaturePrior(nn.Module):
     """Small shared 5x10 Feature expert fused as a third Gaussian prior."""
 
-    def __init__(self, hidden_dim: int = 16):
+    def __init__(self, hidden_dim: int = 16, max_mixture_weight: float = 0.25):
         super().__init__()
+        if not 0.0 < max_mixture_weight <= 1.0:
+            raise ValueError("max_mixture_weight must be in (0, 1]")
+        self.max_mixture_weight = float(max_mixture_weight)
         input_dim = FEATURE_CHUNK_DIM * 2 + 1
         output_dim = FEATURE_CHUNK_DIM * 2 + 1
         self.network = nn.Sequential(
@@ -125,7 +128,7 @@ class CausalFeaturePrior(nn.Module):
         final = self.network[-1]
         nn.init.zeros_(final.weight)
         nn.init.zeros_(final.bias)
-        final.bias.data[-1] = -6.0
+        final.bias.data[-1] = -8.0
 
     def forward(
         self,
@@ -176,7 +179,9 @@ class CausalFeaturePrior(nn.Module):
             neighbor_std_chunks + 0.5 * q_chunks,
             min=1e-9,
         ) * torch.exp(log_scale)
-        mixture_weight = torch.sigmoid(gate_logit) * chunk_support
+        mixture_weight = (
+            self.max_mixture_weight * torch.sigmoid(gate_logit) * chunk_support
+        )
         return (
             causal_mean.reshape_as(base_mean),
             causal_scale.reshape_as(base_scale),

@@ -68,7 +68,10 @@ def main():
     if graph_checksum(graph) != context["graph_checksum"]:
         raise RuntimeError("fresh decoder causal graph checksum mismatch")
 
-    prior = CausalFeaturePrior(config["causal_hidden_dim"]).cuda()
+    prior = CausalFeaturePrior(
+        config["causal_hidden_dim"],
+        max_mixture_weight=config["causal_max_mixture_weight"],
+    ).cuda()
     prior_state, prior_metadata = deserialize_named_tensors(
         package_path / context["causal_model_file"]
     )
