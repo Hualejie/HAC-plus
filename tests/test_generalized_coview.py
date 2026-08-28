@@ -181,6 +181,30 @@ def test_scaling_only_causal_checkpoint_round_trip(tmp_path):
     )
 
 
+def test_causal_prior_blob_uses_compact_keys_and_accepts_legacy_keys():
+    source = _checkpoint_model()
+    source.use_causal_coview_scaling = True
+    source.causal_coview_scaling_prior = AffineCausalScalingPrior()
+    with torch.no_grad():
+        source.causal_coview_scaling_prior.mean_blend.fill_(0.25)
+    compact = source.coview_serializable_state()
+    assert set(compact) == {"cs.m", "cs.s", "cs.g"}
+
+    legacy = {
+        "causal_scaling.mean_blend": compact["cs.m"],
+        "causal_scaling.log_scale_blend": compact["cs.s"],
+        "causal_scaling.gate_logit": compact["cs.g"],
+    }
+    restored = _checkpoint_model()
+    restored.use_causal_coview_scaling = True
+    restored.causal_coview_scaling_prior = AffineCausalScalingPrior()
+    restored.install_coview_serializable_state(legacy)
+    torch.testing.assert_close(
+        restored.causal_coview_scaling_prior.mean_blend,
+        source.causal_coview_scaling_prior.mean_blend,
+    )
+
+
 def _checkpoint_model():
     model = _context_model("none")
     model.feat_dim = 50

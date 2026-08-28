@@ -70,6 +70,11 @@ bit2MB_scale = 8 * 1024 * 1024
 MAX_batch_size = 3000
 COVIEW_TARGETS = ("none", "feature", "scaling", "offset", "all")
 COVIEW_FEATURE_MODES = ("full", "chunk")
+CAUSAL_PRIOR_BLOB_KEYS = {
+    "mean_blend": "m",
+    "log_scale_blend": "s",
+    "gate_logit": "g",
+}
 TRAINING_CHECKPOINT_VERSION = 2
 
 def get_time():
@@ -648,13 +653,27 @@ class GaussianModel(nn.Module):
                 state[f"gate.{attribute}"] = self.coview_gates[attribute].detach()
         if self.causal_feature_enabled:
             for name, tensor in self.causal_coview_feature_prior.state_dict().items():
-                state[f"causal_feature.{name}"] = tensor
+                state[f"cf.{CAUSAL_PRIOR_BLOB_KEYS[name]}"] = tensor
         if self.causal_scaling_enabled:
             for name, tensor in self.causal_coview_scaling_prior.state_dict().items():
-                state[f"causal_scaling.{name}"] = tensor
+                state[f"cs.{CAUSAL_PRIOR_BLOB_KEYS[name]}"] = tensor
         return state
 
     def install_coview_serializable_state(self, state):
+        state = dict(state)
+        for legacy_prefix, compact_prefix in (
+            ("causal_feature", "cf"),
+            ("causal_scaling", "cs"),
+        ):
+            for name, compact_name in CAUSAL_PRIOR_BLOB_KEYS.items():
+                legacy_key = f"{legacy_prefix}.{name}"
+                compact_key = f"{compact_prefix}.{compact_name}"
+                if legacy_key in state:
+                    if compact_key in state:
+                        raise RuntimeError(
+                            f"duplicate serialized CoView state for {compact_key!r}"
+                        )
+                    state[compact_key] = state.pop(legacy_key)
         expected = set(self.coview_serializable_state())
         actual = set(state)
         if actual != expected:
@@ -681,20 +700,16 @@ class GaussianModel(nn.Module):
                     state[f"gate.{attribute}"].to(device)
                 )
         if self.causal_feature_enabled:
-            prefix = "causal_feature."
             device = next(self.causal_coview_feature_prior.parameters()).device
             self.causal_coview_feature_prior.load_state_dict({
-                name[len(prefix):]: tensor.to(device)
-                for name, tensor in state.items()
-                if name.startswith(prefix)
+                name: state[f"cf.{compact_name}"].to(device)
+                for name, compact_name in CAUSAL_PRIOR_BLOB_KEYS.items()
             })
         if self.causal_scaling_enabled:
-            prefix = "causal_scaling."
             device = next(self.causal_coview_scaling_prior.parameters()).device
             self.causal_coview_scaling_prior.load_state_dict({
-                name[len(prefix):]: tensor.to(device)
-                for name, tensor in state.items()
-                if name.startswith(prefix)
+                name: state[f"cs.{compact_name}"].to(device)
+                for name, compact_name in CAUSAL_PRIOR_BLOB_KEYS.items()
             })
 
     def configure_view_topology_cameras(self, cameras):
