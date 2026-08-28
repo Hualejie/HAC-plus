@@ -53,6 +53,7 @@ def main():
     parser.add_argument("--causal_coview_groups", type=int, default=4)
     parser.add_argument("--causal_coview_candidates", type=int, default=32)
     parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
+    parser.add_argument("--causal_coview_camera_count", type=int, default=0)
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -74,6 +75,7 @@ def main():
         causal_coview_groups=args.causal_coview_groups,
         causal_coview_candidates=args.causal_coview_candidates,
         causal_coview_max_weight=args.causal_coview_max_weight,
+        causal_coview_camera_count=args.causal_coview_camera_count,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,
@@ -107,6 +109,7 @@ def main():
         "coview_target": args.coview_target,
         "use_causal_coview_feature": args.use_causal_coview_feature,
         "use_causal_coview_scaling": args.use_causal_coview_scaling,
+        "causal_coview_camera_count": args.causal_coview_camera_count,
         "num_anchors": int(model._anchor.shape[0]),
         "anchor_checksum": _checksum(model._anchor),
         "feature_checksum": _checksum(model._anchor_feat),

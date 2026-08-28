@@ -68,6 +68,7 @@ class ModelParams(ParamGroup):
         self.causal_coview_candidates = 32
         self.causal_coview_max_weight = 0.25
         self.causal_coview_gate_init = 4.0
+        self.causal_coview_camera_count = 0
         self._source_path = ""
         self._model_path = ""
         self._images = "images"

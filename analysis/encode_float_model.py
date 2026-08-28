@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--causal_coview_candidates", type=int, default=32)
     parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
     parser.add_argument("--causal_coview_gate_init", type=float, default=4.0)
+    parser.add_argument("--causal_coview_camera_count", type=int, default=0)
     parser.add_argument(
         "--causal_prior",
         help="optional frozen causal_feature_model.bin used to initialize the formal codec",
@@ -87,6 +88,7 @@ def main():
         causal_coview_candidates=args.causal_coview_candidates,
         causal_coview_max_weight=args.causal_coview_max_weight,
         causal_coview_gate_init=args.causal_coview_gate_init,
+        causal_coview_camera_count=args.causal_coview_camera_count,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,
@@ -135,8 +137,8 @@ def main():
         if not args.camera_context:
             raise ValueError("--camera_context is required for an active CoView target")
         context = torch.load(args.camera_context)
-        model._view_topology_cameras = camera_geometry_from_state(
-            context["camera_geometry"]
+        model.configure_view_topology_cameras(
+            camera_geometry_from_state(context["camera_geometry"])
         )
     model.eval()
     log = model.conduct_encoding(
@@ -146,6 +148,7 @@ def main():
         "coview_target": args.coview_target,
         "use_causal_coview_feature": args.use_causal_coview_feature,
         "use_causal_coview_scaling": args.use_causal_coview_scaling,
+        "causal_coview_camera_count": args.causal_coview_camera_count,
         "coview_serialization": args.coview_serialization,
         "encode_log": log,
     }))

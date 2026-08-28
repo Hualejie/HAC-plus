@@ -19,6 +19,7 @@ from scene.coview_context import (
     pair_geometric_view_scores,
     pair_distance_depth_scores,
     serialize_camera_geometry,
+    select_camera_prototypes,
     spatial_topk,
     spatial_topk_queries,
 )
@@ -91,6 +92,20 @@ def test_camera_permutation_invariance():
     np.testing.assert_array_equal(forward.anchor_camera_ids, reverse.anchor_camera_ids)
     for first, second in zip(forward.camera_to_anchor, reverse.camera_to_anchor):
         np.testing.assert_array_equal(first, second)
+
+
+def test_camera_prototype_selection_is_canonical_and_permutation_invariant():
+    cameras = [_camera(f"camera_{index:02d}", index) for index in range(10)]
+    forward = select_camera_prototypes(cameras, 4)
+    reverse = select_camera_prototypes(list(reversed(cameras)), 4)
+
+    assert [camera.image_name for camera in forward] == [
+        "camera_00", "camera_03", "camera_06", "camera_09"
+    ]
+    assert [camera.image_name for camera in reverse] == [
+        camera.image_name for camera in forward
+    ]
+    assert len(select_camera_prototypes(cameras, 0)) == len(cameras)
 
 
 def test_coview_topk_deterministic_tie_break():

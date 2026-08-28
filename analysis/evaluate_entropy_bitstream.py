@@ -63,6 +63,7 @@ def main():
         causal_coview_candidates=dataset.causal_coview_candidates,
         causal_coview_max_weight=dataset.causal_coview_max_weight,
         causal_coview_gate_init=dataset.causal_coview_gate_init,
+        causal_coview_camera_count=dataset.causal_coview_camera_count,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,

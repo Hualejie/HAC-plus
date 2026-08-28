@@ -63,6 +63,7 @@ class ViewTopologyContext:
 VIEW_TOPOLOGY_FEATURE_DIM = 15
 VIEW_TOPOLOGY_CANDIDATE_MODES = ("spatial", "hybrid")
 CAMERA_GEOMETRY_MAGIC = b"CVCAM001"
+CAMERA_PROTOTYPE_SELECTION = "canonical_uniform_v1"
 
 
 def canonicalize_codec_anchors(
@@ -127,6 +128,29 @@ def extract_camera_geometry(cameras: Sequence) -> Tuple[SimpleNamespace, ...]:
             zfar=float(camera.zfar),
         ))
     return tuple(geometry)
+
+
+def select_camera_prototypes(
+    cameras: Sequence,
+    count: int = 0,
+) -> Tuple[SimpleNamespace, ...]:
+    """Select an input-order-invariant uniform subset of canonical cameras.
+
+    ``count == 0`` preserves all cameras.  A positive count samples inclusive
+    endpoints from the camera-sort-key order, matching the c4 Frozen studies.
+    """
+    geometry = extract_camera_geometry(cameras)
+    count = int(count)
+    if count < 0:
+        raise ValueError("camera prototype count must be non-negative")
+    if not geometry:
+        if count:
+            raise ValueError("cannot select camera prototypes from an empty set")
+        return geometry
+    if count == 0 or count >= len(geometry):
+        return geometry
+    indices = np.linspace(0, len(geometry) - 1, count, dtype=np.int64)
+    return tuple(geometry[int(index)] for index in indices)
 
 
 def camera_geometry_state(cameras: Sequence) -> Dict[str, object]:
