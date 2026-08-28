@@ -21,6 +21,12 @@ Net Feature size falls by about 0.106% on `playroom` and 0.080% on
 model is included. Both packages pass fresh-process arithmetic decoding with
 exact quantized Feature symbol-index checksums.
 
+This is a marginal net comparison inside the existing Scaling-CoView setup.
+Train-camera geometry is already required by that setup and is reused by the
+Feature graph. The table does not claim that a vanilla HAC++ package can add all
+camera metadata for 123 bytes; a future full-package comparison must count any
+metadata not already shared by another active CoView stream.
+
 Because the experiment is Frozen, Feature symbols, anchors, hash parameters,
 renderer inputs, and reconstruction are identical. It evaluates conditional
 and net coding only; it is not yet a rate-distortion result.
