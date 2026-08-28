@@ -86,10 +86,48 @@ Server artifacts are under:
 The multi-scene joint-RD runs use GPUs 4--6 and are written under
 `/mnt/003/experiments/causal_coview_joint/`.
 
+## Joint-training result
+
+Three branches resumed matched 15k checkpoints and jointly optimized through
+30k. The table compares the resulting Scaling+Causal-Feature package with the
+corresponding Scaling-only branch. Both sides were re-encoded after packaging
+the renderer networks, so `package delta` is an exact standalone-directory
+comparison rather than a resident-model estimate.
+
+| Scene | Lambda | Package delta | PSNR delta | SSIM delta | LPIPS delta |
+|---|---:|---:|---:|---:|---:|
+| playroom | 0.0005 | **-626 B** | +0.19116 | +0.000079 | +0.010764 |
+| drjohnson | 0.001 | **-25,671 B** | +0.02375 | +0.000916 | +0.007630 |
+| drjohnson | 0.0005 | +505 B | +0.09400 | +0.000915 | +0.007054 |
+
+The causal expert saturates near its configured 0.25 maximum mixture weight in
+all five Feature chunks, so the small/variable rate result is not caused by the
+optimizer simply disabling the module. It is representation- and lambda-
+dependent: the `drjohnson` 0.001 branch saves about 25.7 kB, while the lower-rate
+branch is essentially neutral. PSNR and SSIM improve at all three tested points,
+but LPIPS regresses at all three. This is therefore not evidence of a universal
+RD gain.
+
+## Standalone rendering contract fixes
+
+The original entropy package could recover coded attributes but still depended
+on resident renderer state. Formal evaluation exposed and fixed two omissions:
+
+- fixed identity anchor rotations and constant opacities are reconstructed at
+  the decoded anchor count;
+- `mlp_opacity`, `mlp_cov`, `mlp_color`, and the optional feature-bank network
+  are now packaged and loaded by the decoder.
+
+These base networks were already included in HAC++'s reported `base_MLPs` size;
+the change makes the on-disk package match that accounting. Fresh-process
+decode, render, and metric evaluation now succeeds without a training model.
+
 ## Current conclusion
 
 The decoder-safe causal CoView mechanism is now a real HAC++ entropy module, not
-only an offline ablation. It gives a small but reproducible frozen net reduction
-on both tested scenes. The remaining decision is empirical: joint training must
-show that these conditional gains survive model cost and improve the RD curve
-across scenes and lambdas.
+only an offline ablation. Frozen conditional coding remains positive on both
+tested scenes, but joint-training gains are too small and inconsistent to claim
+general RD improvement. Candidate expansion has already saturated; the next
+model iteration should change the information path by adding a decoder-causal
+Scaling expert, then condition normalized Offset coding on decoded Scaling,
+before spending compute on a broad scene sweep.
