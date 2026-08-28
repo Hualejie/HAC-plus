@@ -58,6 +58,8 @@ class ModelParams(ParamGroup):
         self.use_view_topology = False
         self.view_topology_k = 8
         self.view_topology_candidates = 16
+        self.view_topology_candidate_mode = "spatial"
+        self.view_topology_view_candidates = 16
         self.coview_target = "none"
         self.coview_feature_mode = "full"
         self._source_path = ""

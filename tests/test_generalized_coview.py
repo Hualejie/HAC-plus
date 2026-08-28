@@ -135,6 +135,8 @@ def _checkpoint_model():
     model.use_feat_bank = False
     model.view_topology_k = 8
     model.view_topology_candidates = 16
+    model.view_topology_candidate_mode = "spatial"
+    model.view_topology_view_candidates = 16
     model.coview_feature_mode = "full"
     for name in (
         "mlp_opacity", "mlp_cov", "mlp_color", "encoding_xyz",

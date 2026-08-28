@@ -38,6 +38,12 @@ def main():
     parser.add_argument("--voxel_size", type=float, default=0.005)
     parser.add_argument("--view_topology_k", type=int, default=8)
     parser.add_argument("--view_topology_candidates", type=int, default=16)
+    parser.add_argument(
+        "--view_topology_candidate_mode",
+        choices=("spatial", "hybrid"),
+        default="spatial",
+    )
+    parser.add_argument("--view_topology_view_candidates", type=int, default=16)
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -56,6 +62,8 @@ def main():
         use_view_topology=True,
         view_topology_k=args.view_topology_k,
         view_topology_candidates=args.view_topology_candidates,
+        view_topology_candidate_mode=args.view_topology_candidate_mode,
+        view_topology_view_candidates=args.view_topology_view_candidates,
         coview_target=args.coview_target,
         coview_feature_mode=args.coview_feature_mode,
         n_features_per_level=args.n_features,

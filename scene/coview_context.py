@@ -59,6 +59,7 @@ class ViewTopologyContext:
 
 
 VIEW_TOPOLOGY_FEATURE_DIM = 15
+VIEW_TOPOLOGY_CANDIDATE_MODES = ("spatial", "hybrid")
 
 
 def canonicalize_codec_anchors(
@@ -367,6 +368,140 @@ def coview_topk(
         "dense_anchor_pair_matrix_created": False,
     }
     return neighbors, neighbor_scores, diagnostics
+
+
+def coview_lsh_candidates(
+    relation: ObservationRelation,
+    k: int = 16,
+    num_hashes: int = 8,
+    band_size: int = 2,
+    bucket_window: Optional[int] = None,
+) -> Tuple[Tuple[np.ndarray, ...], Tuple[np.ndarray, ...], Dict[str, object]]:
+    """Generate bounded non-local CoView candidates with deterministic MinHash.
+
+    The exact global Jaccard Top-K above is useful for analysis but has
+    quadratic total work in the number of unique observation signatures. This
+    codec path instead applies MinHash LSH to sparse camera sets. Only a bounded
+    canonical-index window in each matching band is evaluated with exact
+    Jaccard, so neither resident memory nor pair work is anchor-square.
+
+    Rows may contain fewer than ``k`` candidates. The hybrid topology always
+    unions them with at least ``topk`` Euclidean candidates before selection.
+    """
+    if k <= 0:
+        raise ValueError("k must be positive")
+    if num_hashes <= 0 or band_size <= 0 or num_hashes % band_size:
+        raise ValueError("num_hashes must be positive and divisible by band_size")
+    num_bands = num_hashes // band_size
+    if bucket_window is None:
+        bucket_window = max(2, int(np.ceil(k / num_bands)))
+    if bucket_window <= 0:
+        raise ValueError("bucket_window must be positive")
+
+    group_of_anchor, group_members, incidence = observation_signatures(relation)
+    num_groups = len(group_members)
+    prime = np.int64(2_147_483_647)
+    multipliers = np.asarray(
+        [1_103_515_245, 1_664_525, 22_695_477, 214_013,
+         1_347_758_131, 48_271, 69_069, 16_807],
+        dtype=np.int64,
+    )
+    offsets = np.asarray(
+        [12_345, 1_013_904_223, 1, 2_531_011,
+         668_265_263, 0, 362_437, 97_531],
+        dtype=np.int64,
+    )
+    if num_hashes > multipliers.size:
+        raise ValueError(f"num_hashes cannot exceed {multipliers.size}")
+
+    minhash = np.full((num_groups, num_hashes), prime, dtype=np.int64)
+    for group_idx in range(num_groups):
+        camera_ids = np.flatnonzero(incidence[group_idx]).astype(np.int64) + 1
+        if camera_ids.size:
+            hashed = (
+                camera_ids[:, None] * multipliers[None, :num_hashes]
+                + offsets[None, :num_hashes]
+            ) % prime
+            minhash[group_idx] = hashed.min(axis=0)
+
+    anchor_ids = np.arange(relation.num_anchors, dtype=np.int64)
+    candidate_sets = [set() for _ in range(relation.num_anchors)]
+    for band_idx in range(num_bands):
+        start = band_idx * band_size
+        end = start + band_size
+        keys = minhash[group_of_anchor, start:end]
+        # key column 0 is primary, followed by the remaining columns and the
+        # canonical anchor index for a deterministic within-bucket order.
+        lex_keys = (anchor_ids,) + tuple(
+            keys[:, axis] for axis in reversed(range(band_size))
+        )
+        order = np.lexsort(lex_keys)
+        sorted_keys = keys[order]
+        boundaries = np.flatnonzero(
+            np.any(sorted_keys[1:] != sorted_keys[:-1], axis=1)
+        ) + 1
+        bucket_starts = np.concatenate((np.asarray([0]), boundaries))
+        bucket_ends = np.concatenate((boundaries, np.asarray([order.size])))
+
+        for bucket_start, bucket_end in zip(bucket_starts, bucket_ends):
+            for position in range(int(bucket_start), int(bucket_end)):
+                anchor_idx = int(order[position])
+                begin = max(int(bucket_start), position - bucket_window)
+                finish = min(int(bucket_end), position + bucket_window + 1)
+                candidate_sets[anchor_idx].update(
+                    int(value) for value in order[begin:finish]
+                    if int(value) != anchor_idx
+                )
+
+    candidate_rows = []
+    score_rows = []
+    raw_counts = np.empty(relation.num_anchors, dtype=np.int64)
+    for anchor_idx, candidate_set in enumerate(candidate_sets):
+        candidates = np.asarray(sorted(candidate_set), dtype=np.int64)
+        raw_counts[anchor_idx] = candidates.size
+        if candidates.size:
+            source_incidence = incidence[group_of_anchor[anchor_idx]]
+            target_incidence = incidence[group_of_anchor[candidates]]
+            intersection = np.logical_and(
+                target_incidence,
+                source_incidence[None, :],
+            ).sum(axis=1)
+            union = np.logical_or(
+                target_incidence,
+                source_incidence[None, :],
+            ).sum(axis=1)
+            scores = np.divide(
+                intersection,
+                union,
+                out=np.zeros(intersection.shape, dtype=np.float32),
+                where=union > 0,
+            )
+            selected = np.lexsort((candidates, -scores))[:k]
+            candidates = candidates[selected]
+            scores = scores[selected]
+        else:
+            scores = np.empty(0, dtype=np.float32)
+        candidate_rows.append(candidates)
+        score_rows.append(scores.astype(np.float32, copy=False))
+
+    retained_counts = np.asarray([row.size for row in candidate_rows])
+    diagnostics = {
+        "num_anchors": relation.num_anchors,
+        "num_cameras": len(relation.camera_keys),
+        "num_edges": int(relation.anchor_camera_ids.size),
+        "num_unique_signatures": num_groups,
+        "num_hashes": num_hashes,
+        "band_size": band_size,
+        "num_bands": num_bands,
+        "bucket_window": bucket_window,
+        "mean_raw_candidate_count": float(raw_counts.mean()),
+        "max_raw_candidate_count": int(raw_counts.max()),
+        "mean_retained_candidate_count": float(retained_counts.mean()),
+        "max_retained_candidate_count": int(retained_counts.max()),
+        "dense_anchor_pair_matrix_created": False,
+        "quadratic_pair_enumeration": False,
+    }
+    return tuple(candidate_rows), tuple(score_rows), diagnostics
 
 
 def spatial_topk(
@@ -716,60 +851,120 @@ def build_view_topology_context(
     cameras: Sequence,
     candidate_k: int = 16,
     topk: int = 8,
+    candidate_mode: str = "spatial",
+    view_candidate_k: int = 16,
     feature_quantization: float = 1e-5,
     pair_batch_size: int = 8192,
 ) -> ViewTopologyContext:
     """Build a deterministic distance/depth-induced inter-anchor graph.
 
-    View Top-K is selected from deterministic Euclidean candidates. The output
-    reads no anchor attribute: its fixed-width feature consists only of edge
-    score statistics, common-camera support, and weighted relative xyz. Final
-    quantization is part of the codec contract and suppresses insignificant
-    cross-device floating-point differences.
+    ``spatial`` mode ranks deterministic Euclidean candidates. ``hybrid`` mode
+    unions those candidates with global sparse-signature Jaccard candidates,
+    then applies the same distance/depth score. The latter lets a strong
+    camera-induced relation enter the graph even when it is not among the
+    nearest Euclidean anchors, without constructing an anchor-square matrix.
+
+    The output reads no anchor attribute: its fixed-width feature consists only
+    of edge score statistics, common-camera support, and weighted relative xyz.
+    Final quantization is part of the codec contract and suppresses
+    insignificant cross-device floating-point differences.
     """
     if codec_xyz.ndim != 2 or codec_xyz.shape[1] != 3:
         raise ValueError("codec_xyz must have shape [N, 3]")
     if not 0 < topk <= candidate_k < codec_xyz.shape[0]:
         raise ValueError("require 0 < topk <= candidate_k < num_anchors")
+    if candidate_mode not in VIEW_TOPOLOGY_CANDIDATE_MODES:
+        raise ValueError(
+            f"candidate_mode must be one of {VIEW_TOPOLOGY_CANDIDATE_MODES}, "
+            f"got {candidate_mode!r}"
+        )
+    if candidate_mode == "hybrid" and not 0 < view_candidate_k < codec_xyz.shape[0]:
+        raise ValueError("hybrid mode requires 0 < view_candidate_k < num_anchors")
     if feature_quantization <= 0:
         raise ValueError("feature_quantization must be positive")
 
     camera_geometry = extract_camera_geometry(cameras)
     xyz = codec_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
-    candidate_neighbors, candidate_distances = spatial_topk(xyz, k=candidate_k)
-    source = np.repeat(np.arange(xyz.shape[0], dtype=np.int64), candidate_k)
-    target = candidate_neighbors.reshape(-1)
-
     relation = build_geometry_observations(codec_xyz, camera_geometry)
     descriptors = build_geometric_observation_descriptors(codec_xyz, camera_geometry, relation)
+    spatial_neighbors, spatial_distances = spatial_topk(xyz, k=candidate_k)
+    view_diagnostics = None
+
+    if candidate_mode == "spatial":
+        candidate_rows = tuple(spatial_neighbors[row] for row in range(xyz.shape[0]))
+        candidate_distance_rows = tuple(
+            spatial_distances[row] for row in range(xyz.shape[0])
+        )
+    else:
+        view_neighbors, _, view_diagnostics = coview_lsh_candidates(
+            relation,
+            k=view_candidate_k,
+        )
+        candidate_rows = []
+        candidate_distance_rows = []
+        for anchor_idx in range(xyz.shape[0]):
+            # Sorted canonical indices make the union independent of the order
+            # returned by either candidate generator. Scoring below determines
+            # the final order.
+            candidates = np.unique(np.concatenate((
+                spatial_neighbors[anchor_idx],
+                view_neighbors[anchor_idx],
+            )))
+            candidates = candidates[candidates != anchor_idx]
+            candidate_rows.append(candidates)
+            candidate_distance_rows.append(
+                np.linalg.norm(xyz[candidates] - xyz[anchor_idx], axis=1)
+            )
+        candidate_rows = tuple(candidate_rows)
+        candidate_distance_rows = tuple(candidate_distance_rows)
+
+    candidate_counts = np.asarray(
+        [row.size for row in candidate_rows],
+        dtype=np.int64,
+    )
+    candidate_indptr = np.empty(xyz.shape[0] + 1, dtype=np.int64)
+    candidate_indptr[0] = 0
+    np.cumsum(candidate_counts, out=candidate_indptr[1:])
+    source = np.repeat(
+        np.arange(xyz.shape[0], dtype=np.int64),
+        candidate_counts,
+    )
+    target = np.concatenate(candidate_rows)
+    candidate_distances = np.concatenate(candidate_distance_rows)
+
     pair_scores = pair_distance_depth_scores(
         descriptors,
         source,
         target,
         batch_size=pair_batch_size,
     )
-    distance_score = pair_scores["geometric_distance"].reshape(-1, candidate_k)
-    depth_score = pair_scores["geometric_depth"].reshape(-1, candidate_k)
-    common_count = pair_scores["common_camera_count"].reshape(-1, candidate_k)
+    distance_score = pair_scores["geometric_distance"]
+    depth_score = pair_scores["geometric_depth"]
+    common_count = pair_scores["common_camera_count"]
     joint_score = 0.5 * (distance_score + depth_score)
     valid = common_count > 0
 
-    selected_offset = np.empty((xyz.shape[0], topk), dtype=np.int64)
+    neighbors = np.empty((xyz.shape[0], topk), dtype=np.int64)
+    selected_spatial_distance = np.empty((xyz.shape[0], topk), dtype=np.float64)
+    selected_distance = np.empty((xyz.shape[0], topk), dtype=np.float32)
+    selected_depth = np.empty((xyz.shape[0], topk), dtype=np.float32)
+    selected_common = np.empty((xyz.shape[0], topk), dtype=np.float32)
     for anchor_idx in range(xyz.shape[0]):
+        begin = candidate_indptr[anchor_idx]
+        end = candidate_indptr[anchor_idx + 1]
+        candidates = target[begin:end]
         # Common-camera pairs rank before unsupported pairs; ties use the
         # canonical anchor index, independent of scipy query order.
-        ranking_score = np.where(valid[anchor_idx], joint_score[anchor_idx], -1.0)
-        selected_offset[anchor_idx] = np.lexsort((
-            candidate_neighbors[anchor_idx],
+        ranking_score = np.where(valid[begin:end], joint_score[begin:end], -1.0)
+        selected = np.lexsort((
+            candidates,
             -ranking_score,
         ))[:topk]
-
-    row = np.arange(xyz.shape[0], dtype=np.int64)[:, None]
-    neighbors = candidate_neighbors[row, selected_offset]
-    selected_spatial_distance = candidate_distances[row, selected_offset]
-    selected_distance = distance_score[row, selected_offset]
-    selected_depth = depth_score[row, selected_offset]
-    selected_common = common_count[row, selected_offset]
+        neighbors[anchor_idx] = candidates[selected]
+        selected_spatial_distance[anchor_idx] = candidate_distances[begin:end][selected]
+        selected_distance[anchor_idx] = distance_score[begin:end][selected]
+        selected_depth[anchor_idx] = depth_score[begin:end][selected]
+        selected_common[anchor_idx] = common_count[begin:end][selected]
     selected_valid = selected_common > 0
     selected_joint = 0.5 * (selected_distance + selected_depth)
 
@@ -819,18 +1014,32 @@ def build_view_topology_context(
         np.round(features / feature_quantization) * feature_quantization
     ).astype(np.float32)
 
+    selected_outside_spatial = np.empty_like(neighbors, dtype=np.bool_)
+    for anchor_idx in range(xyz.shape[0]):
+        selected_outside_spatial[anchor_idx] = ~np.isin(
+            neighbors[anchor_idx],
+            spatial_neighbors[anchor_idx],
+        )
+
     diagnostics = {
         "num_anchors": int(xyz.shape[0]),
         "num_cameras": len(camera_geometry),
+        "candidate_mode": candidate_mode,
         "candidate_k": int(candidate_k),
+        "view_candidate_k": int(view_candidate_k) if candidate_mode == "hybrid" else 0,
         "topk": int(topk),
-        "num_candidate_pairs": int(xyz.shape[0] * candidate_k),
+        "num_candidate_pairs": int(candidate_counts.sum()),
+        "mean_candidate_count": float(candidate_counts.mean()),
+        "max_candidate_count": int(candidate_counts.max()),
+        "selected_outside_spatial_fraction": float(selected_outside_spatial.mean()),
         "num_observation_edges": int(relation.anchor_camera_ids.size),
         "mean_valid_neighbor_fraction": float(valid_fraction.mean()),
         "feature_quantization": float(feature_quantization),
         "feature_dim": VIEW_TOPOLOGY_FEATURE_DIM,
         "dense_anchor_pair_matrix_created": False,
     }
+    if view_diagnostics is not None:
+        diagnostics["view_candidate_diagnostics"] = view_diagnostics
     return ViewTopologyContext(
         features=features,
         neighbors=neighbors,

@@ -42,6 +42,7 @@ from utils.coview_serialization import (
     serialize_named_tensors,
 )
 from scene.coview_context import (
+    VIEW_TOPOLOGY_CANDIDATE_MODES,
     VIEW_TOPOLOGY_FEATURE_DIM,
     build_view_topology_context,
     camera_geometry_from_state,
@@ -272,6 +273,8 @@ class GaussianModel(nn.Module):
                  use_view_topology: bool=False,
                  view_topology_k: int=8,
                  view_topology_candidates: int=16,
+                 view_topology_candidate_mode: str="spatial",
+                 view_topology_view_candidates: int=16,
                  coview_target: str="none",
                  coview_feature_mode: str="full",
                  ):
@@ -304,6 +307,14 @@ class GaussianModel(nn.Module):
         self.use_view_topology = use_view_topology
         self.view_topology_k = view_topology_k
         self.view_topology_candidates = view_topology_candidates
+        if view_topology_candidate_mode not in VIEW_TOPOLOGY_CANDIDATE_MODES:
+            raise ValueError(
+                "view_topology_candidate_mode must be one of "
+                f"{VIEW_TOPOLOGY_CANDIDATE_MODES}, got "
+                f"{view_topology_candidate_mode!r}"
+            )
+        self.view_topology_candidate_mode = view_topology_candidate_mode
+        self.view_topology_view_candidates = view_topology_view_candidates
         if coview_target not in COVIEW_TARGETS:
             raise ValueError(
                 f"coview_target must be one of {COVIEW_TARGETS}, got {coview_target!r}"
@@ -321,6 +332,12 @@ class GaussianModel(nn.Module):
         self.coview_feature_mode = coview_feature_mode
         if self.use_view_topology and not 0 < self.view_topology_k <= self.view_topology_candidates:
             raise ValueError("require 0 < view_topology_k <= view_topology_candidates")
+        if (
+            self.use_view_topology
+            and self.view_topology_candidate_mode == "hybrid"
+            and self.view_topology_view_candidates <= 0
+        ):
+            raise ValueError("hybrid view topology requires positive view candidates")
         self._view_topology_cameras = tuple()
         self._training_view_topology = None
         self._training_view_topology_diagnostics = None
@@ -582,7 +599,13 @@ class GaussianModel(nn.Module):
             return None, None
         if not self._view_topology_cameras:
             raise RuntimeError("train-camera geometry is required for view topology")
-        if anchor.shape[0] <= self.view_topology_candidates:
+        required_candidates = self.view_topology_candidates
+        if self.view_topology_candidate_mode == "hybrid":
+            required_candidates = max(
+                required_candidates,
+                self.view_topology_view_candidates,
+            )
+        if anchor.shape[0] <= required_candidates:
             features = torch.zeros(
                 (anchor.shape[0], VIEW_TOPOLOGY_FEATURE_DIM),
                 device=anchor.device,
@@ -601,6 +624,8 @@ class GaussianModel(nn.Module):
             self._view_topology_cameras,
             candidate_k=self.view_topology_candidates,
             topk=self.view_topology_k,
+            candidate_mode=self.view_topology_candidate_mode,
+            view_candidate_k=self.view_topology_view_candidates,
         )
         features = torch.as_tensor(topology.features, device=anchor.device, dtype=anchor.dtype)
         diagnostics = dict(topology.diagnostics)
@@ -813,6 +838,8 @@ class GaussianModel(nn.Module):
                 "use_view_topology": self.use_view_topology,
                 "view_topology_k": self.view_topology_k,
                 "view_topology_candidates": self.view_topology_candidates,
+                "view_topology_candidate_mode": self.view_topology_candidate_mode,
+                "view_topology_view_candidates": self.view_topology_view_candidates,
                 "coview_feature_mode": self.coview_feature_mode,
             },
             "gaussian_parameters": {
@@ -851,12 +878,17 @@ class GaussianModel(nn.Module):
             "use_view_topology": self.use_view_topology,
             "view_topology_k": self.view_topology_k,
             "view_topology_candidates": self.view_topology_candidates,
+            "view_topology_candidate_mode": self.view_topology_candidate_mode,
+            "view_topology_view_candidates": self.view_topology_view_candidates,
             "coview_feature_mode": self.coview_feature_mode,
         }
         for key, value in expected.items():
-            saved_value = architecture.get(
-                key, "full" if key == "coview_feature_mode" else None
-            )
+            legacy_defaults = {
+                "coview_feature_mode": "full",
+                "view_topology_candidate_mode": "spatial",
+                "view_topology_view_candidates": 16,
+            }
+            saved_value = architecture.get(key, legacy_defaults.get(key))
             if saved_value != value:
                 raise RuntimeError(
                     f"training checkpoint {key} mismatch: "
@@ -1558,6 +1590,10 @@ class GaussianModel(nn.Module):
             checkpoint.update({
                 'coview_target': self.coview_target,
                 'coview_feature_mode': self.coview_feature_mode,
+                'view_topology_k': self.view_topology_k,
+                'view_topology_candidates': self.view_topology_candidates,
+                'view_topology_candidate_mode': self.view_topology_candidate_mode,
+                'view_topology_view_candidates': self.view_topology_view_candidates,
                 'coview_shared_mlp': self.mlp_coview_shared.state_dict(),
                 'coview_feature_head': self.mlp_coview_feature.state_dict(),
                 'coview_scaling_head': self.mlp_coview_scaling.state_dict(),
@@ -1591,6 +1627,23 @@ class GaussianModel(nn.Module):
                     "CoView Feature head mode mismatch: "
                     f"{checkpoint_feature_mode!r} != {self.coview_feature_mode!r}"
                 )
+            topology_config = {
+                'view_topology_k': self.view_topology_k,
+                'view_topology_candidates': self.view_topology_candidates,
+                'view_topology_candidate_mode': self.view_topology_candidate_mode,
+                'view_topology_view_candidates': self.view_topology_view_candidates,
+            }
+            legacy_defaults = {
+                'view_topology_candidate_mode': 'spatial',
+                'view_topology_view_candidates': 16,
+            }
+            for key, expected in topology_config.items():
+                saved = checkpoint.get(key, legacy_defaults.get(key))
+                if saved is not None and saved != expected:
+                    raise RuntimeError(
+                        f"CoView checkpoint {key} mismatch: "
+                        f"{saved!r} != {expected!r}"
+                    )
             self.mlp_coview_shared.load_state_dict(checkpoint['coview_shared_mlp'])
             if load_coview_feature_head:
                 self.mlp_coview_feature.load_state_dict(checkpoint['coview_feature_head'])
@@ -1764,6 +1817,8 @@ class GaussianModel(nn.Module):
             'coview_feature_mode': self.coview_feature_mode,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
+            'view_topology_candidate_mode': self.view_topology_candidate_mode,
+            'view_topology_view_candidates': self.view_topology_view_candidates,
             'grid_mlp': self.mlp_grid.state_dict(),
             'deform_mlp': self.mlp_deform.state_dict(),
         }
@@ -1978,11 +2033,16 @@ class GaussianModel(nn.Module):
             'coview_feature_mode': self.coview_feature_mode,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
+            'view_topology_candidate_mode': self.view_topology_candidate_mode,
+            'view_topology_view_candidates': self.view_topology_view_candidates,
         }
         for key, expected in expected_config.items():
-            saved_value = entropy_context.get(
-                key, "full" if key == "coview_feature_mode" else None
-            )
+            legacy_defaults = {
+                "coview_feature_mode": "full",
+                "view_topology_candidate_mode": "spatial",
+                "view_topology_view_candidates": 16,
+            }
+            saved_value = entropy_context.get(key, legacy_defaults.get(key))
             if saved_value != expected:
                 raise RuntimeError(
                     f"entropy context {key} mismatch: "

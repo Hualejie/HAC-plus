@@ -13,6 +13,7 @@ from scene.coview_context import (
     camera_geometry_from_state,
     camera_geometry_state,
     canonicalize_codec_anchors,
+    coview_lsh_candidates,
     coview_topk,
     pair_geometric_view_scores,
     pair_distance_depth_scores,
@@ -113,6 +114,32 @@ def test_coview_uses_bounded_signature_score_blocks_not_anchor_square():
     assert diagnostics["dense_anchor_pair_matrix_created"] is False
 
 
+def test_coview_lsh_candidates_are_bounded_and_deterministic():
+    relation = _relation(
+        [{0, 1}, {0}, {0, 1}, {1}, {1, 2}, {2}, {0, 2}, set()],
+        num_cameras=3,
+    )
+    first_rows, first_scores, first_diagnostics = coview_lsh_candidates(
+        relation,
+        k=3,
+        bucket_window=2,
+    )
+    second_rows, second_scores, second_diagnostics = coview_lsh_candidates(
+        relation,
+        k=3,
+        bucket_window=2,
+    )
+
+    for first, second in zip(first_rows, second_rows):
+        np.testing.assert_array_equal(first, second)
+        assert first.size <= 3
+    for first, second in zip(first_scores, second_scores):
+        np.testing.assert_array_equal(first, second)
+    assert first_diagnostics == second_diagnostics
+    assert first_diagnostics["quadratic_pair_enumeration"] is False
+    assert first_diagnostics["dense_anchor_pair_matrix_created"] is False
+
+
 def test_spatial_topk_ties_resolve_by_anchor_index():
     xyz = np.asarray([
         [0.0, 0.0, 0.0],
@@ -182,6 +209,70 @@ def test_view_topology_is_camera_permutation_invariant_and_quantized():
     np.testing.assert_allclose(first.features / 1e-4, np.round(first.features / 1e-4), atol=1e-3)
     assert first.features.shape == (4, 15)
     assert first.diagnostics["dense_anchor_pair_matrix_created"] is False
+
+
+def test_hybrid_view_candidates_escape_the_spatial_candidate_ceiling():
+    xyz = torch.tensor([
+        [-0.90, 0.0, 0.50],
+        [-0.85, 0.0, 1.00],
+        [-0.80, 0.0, 1.00],
+        [-0.75, 0.0, 1.00],
+        [0.00, 0.0, 1.00],
+        [0.90, 0.0, 0.50],
+    ])
+    cameras = [
+        _camera("near", 0, zfar=0.75),
+        _camera("far", 1, zfar=3.0),
+    ]
+
+    spatial = build_view_topology_context(
+        xyz,
+        cameras,
+        candidate_k=3,
+        topk=1,
+        candidate_mode="spatial",
+    )
+    hybrid = build_view_topology_context(
+        xyz,
+        list(reversed(cameras)),
+        candidate_k=3,
+        topk=1,
+        candidate_mode="hybrid",
+        view_candidate_k=2,
+    )
+
+    assert 5 not in spatial.neighbors[0]
+    assert hybrid.neighbors[0, 0] == 5
+    assert hybrid.diagnostics["candidate_mode"] == "hybrid"
+    assert hybrid.diagnostics["selected_outside_spatial_fraction"] > 0.0
+    assert hybrid.diagnostics["dense_anchor_pair_matrix_created"] is False
+
+
+def test_hybrid_view_topology_is_camera_permutation_invariant():
+    xyz = torch.tensor([
+        [-0.90, 0.0, 0.50],
+        [-0.85, 0.0, 1.00],
+        [-0.80, 0.0, 1.00],
+        [-0.75, 0.0, 1.00],
+        [0.00, 0.0, 1.00],
+        [0.90, 0.0, 0.50],
+    ])
+    cameras = [
+        _camera("near", 0, zfar=0.75),
+        _camera("far", 1, zfar=3.0),
+    ]
+    kwargs = {
+        "candidate_k": 3,
+        "topk": 2,
+        "candidate_mode": "hybrid",
+        "view_candidate_k": 2,
+    }
+
+    forward = build_view_topology_context(xyz, cameras, **kwargs)
+    reverse = build_view_topology_context(xyz, list(reversed(cameras)), **kwargs)
+
+    np.testing.assert_array_equal(forward.neighbors, reverse.neighbors)
+    np.testing.assert_array_equal(forward.features, reverse.features)
 
 
 def test_view_topology_camera_package_round_trip():

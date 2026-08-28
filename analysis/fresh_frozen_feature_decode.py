@@ -32,6 +32,12 @@ def main():
         use_view_topology=True,
         view_topology_k=config["view_topology_k"],
         view_topology_candidates=config["view_topology_candidates"],
+        view_topology_candidate_mode=config.get(
+            "view_topology_candidate_mode", "spatial"
+        ),
+        view_topology_view_candidates=config.get(
+            "view_topology_view_candidates", 16
+        ),
         coview_target=config["coview_target"],
         coview_feature_mode=config["coview_feature_mode"],
         n_features_per_level=config["n_features"],
