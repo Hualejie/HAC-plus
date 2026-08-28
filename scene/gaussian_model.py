@@ -2063,7 +2063,8 @@ class GaussianModel(nn.Module):
             )
             causal_mean, causal_scale, causal_weight = (
                 self.causal_coview_feature_prior(
-                    mixture_mean, mixture_scale, Q_feat,
+                    mixture_mean, mixture_scale,
+                    Q_feat.expand_as(mixture_mean).contiguous(),
                     neighbor_mean, neighbor_std, support,
                 )
             )
