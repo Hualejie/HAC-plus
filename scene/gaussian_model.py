@@ -1205,6 +1205,7 @@ class GaussianModel(nn.Module):
                 "causal_coview_camera_count": getattr(
                     self, "causal_coview_camera_count", 0
                 ),
+                "causal_coview_camera_selection": CAMERA_PROTOTYPE_SELECTION,
             },
             "gaussian_parameters": {
                 name: {
@@ -1264,6 +1265,7 @@ class GaussianModel(nn.Module):
             "causal_coview_camera_count": getattr(
                 self, "causal_coview_camera_count", 0
             ),
+            "causal_coview_camera_selection": CAMERA_PROTOTYPE_SELECTION,
         }
         for key, value in expected.items():
             legacy_defaults = {
@@ -1276,6 +1278,7 @@ class GaussianModel(nn.Module):
                 "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
                 "causal_coview_camera_count": 0,
+                "causal_coview_camera_selection": CAMERA_PROTOTYPE_SELECTION,
             }
             saved_value = architecture.get(key, legacy_defaults.get(key))
             if branching_to_causal and key in {
@@ -1285,6 +1288,7 @@ class GaussianModel(nn.Module):
                 "causal_coview_candidates",
                 "causal_coview_max_weight",
                 "causal_coview_camera_count",
+                "causal_coview_camera_selection",
             }:
                 continue
             if saved_value != value:
@@ -2049,6 +2053,7 @@ class GaussianModel(nn.Module):
                 'causal_coview_camera_count': getattr(
                     self, 'causal_coview_camera_count', 0
                 ),
+                'causal_coview_camera_selection': CAMERA_PROTOTYPE_SELECTION,
             })
             if self.causal_feature_enabled:
                 checkpoint['causal_coview_feature_prior'] = (
@@ -2127,11 +2132,14 @@ class GaussianModel(nn.Module):
                 'causal_coview_camera_count': getattr(
                     self, 'causal_coview_camera_count', 0
                 ),
+                'causal_coview_camera_selection': CAMERA_PROTOTYPE_SELECTION,
             }
             for key, value in expected.items():
-                saved = checkpoint.get(
-                    key, 0 if key == 'causal_coview_camera_count' else None
-                )
+                legacy_defaults = {
+                    'causal_coview_camera_count': 0,
+                    'causal_coview_camera_selection': CAMERA_PROTOTYPE_SELECTION,
+                }
+                saved = checkpoint.get(key, legacy_defaults.get(key))
                 if saved != value:
                     raise RuntimeError(
                         f"causal CoView checkpoint {key} mismatch: "
@@ -2392,7 +2400,6 @@ class GaussianModel(nn.Module):
             'causal_coview_groups': self.causal_coview_groups,
             'causal_coview_candidates': self.causal_coview_candidates,
             'causal_coview_max_weight': self.causal_coview_max_weight,
-            'causal_coview_camera_count': self.causal_coview_camera_count,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
             'view_topology_candidate_mode': self.view_topology_candidate_mode,
@@ -2444,11 +2451,6 @@ class GaussianModel(nn.Module):
                 'coview_model_metadata': coview_model_metadata,
                 'camera_geometry_file': camera_geometry_file,
                 'camera_geometry_metadata': camera_geometry_metadata,
-                'camera_prototype_selection': (
-                    CAMERA_PROTOTYPE_SELECTION
-                    if self.causal_coview_camera_count
-                    else 'all_canonical'
-                ),
             })
             if self.coview_enabled:
                 topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
@@ -2721,7 +2723,6 @@ class GaussianModel(nn.Module):
             'causal_coview_groups': self.causal_coview_groups,
             'causal_coview_candidates': self.causal_coview_candidates,
             'causal_coview_max_weight': self.causal_coview_max_weight,
-            'causal_coview_camera_count': self.causal_coview_camera_count,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
             'view_topology_candidate_mode': self.view_topology_candidate_mode,
@@ -2737,7 +2738,6 @@ class GaussianModel(nn.Module):
                 "causal_coview_groups": 4,
                 "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
-                "causal_coview_camera_count": 0,
                 "use_feat_bank": False,
             }
             saved_value = entropy_context.get(key, legacy_defaults.get(key))
