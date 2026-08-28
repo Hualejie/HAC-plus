@@ -139,20 +139,40 @@ class CausalFeaturePrior(nn.Module):
         neighbor_std: torch.Tensor,
         support: torch.Tensor,
     ):
-        if base_mean.shape[-1] != FEATURE_CHUNKS * FEATURE_CHUNK_DIM:
-            raise ValueError("Feature prior expects 50 channels")
+        return self.forward_selected(
+            base_mean,
+            base_scale,
+            q_feature,
+            neighbor_mean,
+            neighbor_std,
+            support,
+        )
+
+    def forward_selected(
+        self,
+        base_mean: torch.Tensor,
+        base_scale: torch.Tensor,
+        q_feature: torch.Tensor,
+        neighbor_mean: torch.Tensor,
+        neighbor_std: torch.Tensor,
+        support: torch.Tensor,
+    ):
+        """Evaluate one or more complete 10-channel Feature chunks."""
+        if base_mean.shape[-1] % FEATURE_CHUNK_DIM:
+            raise ValueError("selected Feature channels must contain full chunks")
         batch = base_mean.shape[0]
-        base_mean_chunks = base_mean.view(batch, FEATURE_CHUNKS, FEATURE_CHUNK_DIM)
+        num_chunks = base_mean.shape[-1] // FEATURE_CHUNK_DIM
+        base_mean_chunks = base_mean.view(batch, num_chunks, FEATURE_CHUNK_DIM)
         base_scale_chunks = torch.clamp(
-            base_scale.view(batch, FEATURE_CHUNKS, FEATURE_CHUNK_DIM),
+            base_scale.view(batch, num_chunks, FEATURE_CHUNK_DIM),
             min=1e-9,
         )
-        q_chunks = q_feature.view(batch, FEATURE_CHUNKS, FEATURE_CHUNK_DIM)
+        q_chunks = q_feature.view(batch, num_chunks, FEATURE_CHUNK_DIM)
         neighbor_mean_chunks = neighbor_mean.view(
-            batch, FEATURE_CHUNKS, FEATURE_CHUNK_DIM
+            batch, num_chunks, FEATURE_CHUNK_DIM
         )
         neighbor_std_chunks = neighbor_std.view(
-            batch, FEATURE_CHUNKS, FEATURE_CHUNK_DIM
+            batch, num_chunks, FEATURE_CHUNK_DIM
         )
         normalized_delta = (
             neighbor_mean_chunks - base_mean_chunks
@@ -162,7 +182,7 @@ class CausalFeaturePrior(nn.Module):
             min=1e-6,
             max=1e6,
         ))
-        chunk_support = support[:, None, :].expand(-1, FEATURE_CHUNKS, -1)
+        chunk_support = support[:, None, :].expand(-1, num_chunks, -1)
         network_input = torch.cat(
             (normalized_delta, normalized_std, chunk_support), dim=-1
         )
@@ -185,7 +205,7 @@ class CausalFeaturePrior(nn.Module):
         return (
             causal_mean.reshape_as(base_mean),
             causal_scale.reshape_as(base_scale),
-            mixture_weight.repeat_interleave(FEATURE_CHUNK_DIM, dim=1).reshape_as(
-                base_mean
-            ),
+            mixture_weight.repeat_interleave(
+                FEATURE_CHUNK_DIM, dim=1
+            ).reshape_as(base_mean),
         )

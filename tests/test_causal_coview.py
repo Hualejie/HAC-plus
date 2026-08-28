@@ -92,3 +92,13 @@ def test_causal_feature_prior_preserves_5x10_shapes_and_zero_support():
         torch.testing.assert_close(
             chunk_weight, chunk_weight[:, :1].expand_as(chunk_weight)
         )
+
+    selected = prior.forward_selected(
+        base_mean[:, :10],
+        base_scale[:, :10],
+        q_feature[:, :10],
+        neighbor_mean[:, :10],
+        neighbor_std[:, :10],
+        support,
+    )
+    assert all(value.shape == (2, 10) for value in selected)

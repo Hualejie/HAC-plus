@@ -19,6 +19,22 @@ from utils.entropy_models import Entropy_gaussian_mix_prob_3
 from utils.entropy_models import Entropy_gaussian
 
 
+def mixture_moments(means, scales, probabilities):
+    """Moment-match a Gaussian mixture for stable causal-expert initialization."""
+    mixture_mean = sum(
+        probability * mean
+        for probability, mean in zip(probabilities, means)
+    )
+    second_moment = sum(
+        probability * (scale.square() + mean.square())
+        for probability, mean, scale in zip(probabilities, means, scales)
+    )
+    mixture_scale = torch.sqrt(torch.clamp(
+        second_moment - mixture_mean.square(), min=1e-9
+    ))
+    return mixture_mean, mixture_scale
+
+
 def causal_feature_components(
     model,
     causal_prior,
@@ -46,28 +62,38 @@ def causal_feature_components(
             chunk * FEATURE_CHUNK_DIM,
             (chunk + 1) * FEATURE_CHUNK_DIM,
         )
-    causal_mean, causal_scale, causal_weight = causal_prior(
-        mean,
-        scale,
-        q_feature,
-        neighbor_mean,
-        neighbor_std,
-        support,
-    )
     base_probabilities = torch.softmax(
         torch.stack((probability[:, feature_slice], probability_adjusted), dim=-1),
         dim=-1,
     )
+    selected_means = (mean[:, feature_slice], mean_adjusted)
+    selected_scales = (
+        torch.clamp(scale[:, feature_slice], min=1e-9),
+        torch.clamp(scale_adjusted, min=1e-9),
+    )
+    mixture_mean, mixture_scale = mixture_moments(
+        selected_means,
+        selected_scales,
+        (base_probabilities[..., 0], base_probabilities[..., 1]),
+    )
+    causal_mean, causal_scale, causal_weight = causal_prior.forward_selected(
+        mixture_mean,
+        mixture_scale,
+        q_feature[:, feature_slice],
+        neighbor_mean[:, feature_slice],
+        neighbor_std[:, feature_slice],
+        support,
+    )
     causal_weight = torch.clamp(
-        causal_weight[:, feature_slice], min=0.0, max=1.0 - 1e-6
+        causal_weight, min=0.0, max=1.0 - 1e-6
     )
     base_mass = 1.0 - causal_weight
     return (
-        (mean[:, feature_slice], mean_adjusted, causal_mean[:, feature_slice]),
+        (mean[:, feature_slice], mean_adjusted, causal_mean),
         (
             torch.clamp(scale[:, feature_slice], min=1e-9),
             torch.clamp(scale_adjusted, min=1e-9),
-            torch.clamp(causal_scale[:, feature_slice], min=1e-9),
+            torch.clamp(causal_scale, min=1e-9),
         ),
         (
             base_probabilities[..., 0] * base_mass,
@@ -118,10 +144,23 @@ def causal_expert_rate_bits(
     support,
 ):
     """Standalone causal-expert objective used before mixture fine-tuning."""
-    mean, scale, _, _ = feature_parameters(model, anchors)
+    mean, scale, probability, _ = feature_parameters(model, anchors)
+    mean_adjusted, scale_adjusted, probability_adjusted = (
+        model.get_deform_mlp.forward(
+            symbols, torch.cat((mean, scale, probability), dim=-1)
+        )
+    )
+    base_probabilities = torch.softmax(
+        torch.stack((probability, probability_adjusted), dim=-1), dim=-1
+    )
+    mixture_mean, mixture_scale = mixture_moments(
+        (mean, mean_adjusted),
+        (torch.clamp(scale, min=1e-9), torch.clamp(scale_adjusted, min=1e-9)),
+        (base_probabilities[..., 0], base_probabilities[..., 1]),
+    )
     causal_mean, causal_scale, _ = causal_prior(
-        mean,
-        scale,
+        mixture_mean,
+        mixture_scale,
         q_feature,
         neighbor_mean,
         neighbor_std,
