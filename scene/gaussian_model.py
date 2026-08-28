@@ -840,7 +840,15 @@ class GaussianModel(nn.Module):
         output_mean[selected_valid] = mean
         output_std[selected_valid] = torch.sqrt(torch.clamp(variance, min=0.0))
         output_support[selected_valid] = support
-        return output_mean, output_std, output_support
+        # Earlier-group symbols are decoder state, not optimization targets of
+        # the current conditional. Stop cross-anchor gradients (in particular
+        # through sqrt(variance) at zero support) while retaining gradients for
+        # the current symbol, HAC++ predictor and causal-prior parameters.
+        return (
+            output_mean.detach(),
+            output_std.detach(),
+            output_support.detach(),
+        )
 
     def apply_coview_entropy_context(self, mean, scale, topology_features, attribute):
         if attribute not in ("feature", "scaling", "offset"):
