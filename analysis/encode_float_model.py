@@ -55,6 +55,10 @@ def main():
         "--causal_prior",
         help="optional frozen causal_feature_model.bin used to initialize the formal codec",
     )
+    parser.add_argument(
+        "--causal_scaling_prior",
+        help="optional frozen causal_scaling_model.bin used to initialize the formal codec",
+    )
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -91,6 +95,7 @@ def main():
     model.load_mlp_checkpoints(
         str(float_path / "checkpoint.pth"),
         load_causal_feature_prior=not bool(args.causal_prior),
+        load_causal_scaling_prior=not bool(args.causal_scaling_prior),
     )
     if args.causal_prior:
         if not model.causal_feature_enabled:
@@ -105,6 +110,23 @@ def main():
             )
         device = next(model.causal_coview_feature_prior.parameters()).device
         model.causal_coview_feature_prior.load_state_dict({
+            name: tensor.to(device) for name, tensor in causal_state.items()
+        })
+    if args.causal_scaling_prior:
+        if not model.causal_scaling_enabled:
+            raise ValueError(
+                "--causal_scaling_prior requires --use_causal_coview_scaling"
+            )
+        causal_state, _ = deserialize_named_tensors(args.causal_scaling_prior)
+        expected = set(model.causal_coview_scaling_prior.state_dict())
+        if set(causal_state) != expected:
+            raise RuntimeError(
+                "frozen causal Scaling prior state mismatch: "
+                f"missing={sorted(expected - set(causal_state))}, "
+                f"extra={sorted(set(causal_state) - expected)}"
+            )
+        device = next(model.causal_coview_scaling_prior.parameters()).device
+        model.causal_coview_scaling_prior.load_state_dict({
             name: tensor.to(device) for name, tensor in causal_state.items()
         })
     model.x_bound_min = torch.load(float_path / "x_bound_min.pkl")
