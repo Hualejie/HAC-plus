@@ -128,6 +128,24 @@ def test_active_coview_bytes_only_count_shared_and_selected_heads():
     assert none_sizes["base_bits"] == sizes["base_bits"]
 
 
+def test_frozen_topology_override_is_explicit_and_default_remains_strict(tmp_path):
+    source = _checkpoint_model()
+    checkpoint = tmp_path / "checkpoint.pth"
+    source.save_mlp_checkpoints(checkpoint)
+
+    restored = _checkpoint_model()
+    restored.view_topology_candidate_mode = "hybrid"
+    restored.view_topology_candidates = 32
+    restored.view_topology_view_candidates = 32
+    with pytest.raises(RuntimeError, match="view_topology_candidates mismatch"):
+        restored.load_mlp_checkpoints(checkpoint)
+
+    restored.load_mlp_checkpoints(
+        checkpoint,
+        validate_topology_config=False,
+    )
+
+
 def _checkpoint_model():
     model = _context_model("none")
     model.feat_dim = 50

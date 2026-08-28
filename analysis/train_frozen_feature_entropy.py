@@ -58,6 +58,7 @@ def build_model(args, target):
     model.load_mlp_checkpoints(
         str(float_model / "checkpoint.pth"),
         load_coview_feature_head=args.feature_mode == "full",
+        validate_topology_config=not args.allow_topology_override,
     )
     model.x_bound_min = torch.load(float_model / "x_bound_min.pkl")
     model.x_bound_max = torch.load(float_model / "x_bound_max.pkl")
@@ -303,6 +304,15 @@ def main():
         default="spatial",
     )
     parser.add_argument("--view_topology_view_candidates", type=int, default=16)
+    parser.add_argument(
+        "--allow_topology_override",
+        action="store_true",
+        help=(
+            "Allow a Frozen experiment to rebuild topology with candidate "
+            "settings different from the source checkpoint. The represented "
+            "symbols remain fixed and the entropy branch is retrained."
+        ),
+    )
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)

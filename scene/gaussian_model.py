@@ -1603,7 +1603,12 @@ class GaussianModel(nn.Module):
         torch.save(checkpoint, path)
 
 
-    def load_mlp_checkpoints(self, path, load_coview_feature_head=True):
+    def load_mlp_checkpoints(
+        self,
+        path,
+        load_coview_feature_head=True,
+        validate_topology_config=True,
+    ):
         checkpoint = torch.load(path)
         self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
         self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
@@ -1637,13 +1642,14 @@ class GaussianModel(nn.Module):
                 'view_topology_candidate_mode': 'spatial',
                 'view_topology_view_candidates': 16,
             }
-            for key, expected in topology_config.items():
-                saved = checkpoint.get(key, legacy_defaults.get(key))
-                if saved is not None and saved != expected:
-                    raise RuntimeError(
-                        f"CoView checkpoint {key} mismatch: "
-                        f"{saved!r} != {expected!r}"
-                    )
+            if validate_topology_config:
+                for key, expected in topology_config.items():
+                    saved = checkpoint.get(key, legacy_defaults.get(key))
+                    if saved is not None and saved != expected:
+                        raise RuntimeError(
+                            f"CoView checkpoint {key} mismatch: "
+                            f"{saved!r} != {expected!r}"
+                        )
             self.mlp_coview_shared.load_state_dict(checkpoint['coview_shared_mlp'])
             if load_coview_feature_head:
                 self.mlp_coview_feature.load_state_dict(checkpoint['coview_feature_head'])
