@@ -2021,7 +2021,7 @@ class GaussianModel(nn.Module):
                 'coview_offset_head': self.mlp_coview_offset.state_dict(),
                 'coview_gates': self.coview_gates.state_dict(),
             })
-        if self.causal_feature_enabled:
+        if self.causal_coview_enabled:
             checkpoint.update({
                 'use_causal_coview_feature': self.causal_feature_enabled,
                 'use_causal_coview_scaling': self.causal_scaling_enabled,

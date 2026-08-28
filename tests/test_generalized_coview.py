@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from scene.gaussian_model import GaussianModel
+from scene.coview_causal_context import AffineCausalScalingPrior
 from utils.training_checkpoint import (
     camera_checkpoint_key,
     capture_rng_state,
@@ -143,6 +144,40 @@ def test_frozen_topology_override_is_explicit_and_default_remains_strict(tmp_pat
     restored.load_mlp_checkpoints(
         checkpoint,
         validate_topology_config=False,
+    )
+
+
+def test_scaling_only_causal_checkpoint_round_trip(tmp_path):
+    source = _checkpoint_model()
+    source.use_causal_coview_feature = False
+    source.use_causal_coview_scaling = True
+    source.causal_coview_groups = 4
+    source.causal_coview_candidates = 32
+    source.causal_coview_max_weight = 0.25
+    source.causal_coview_scaling_prior = AffineCausalScalingPrior()
+    with torch.no_grad():
+        source.causal_coview_scaling_prior.mean_blend.fill_(0.125)
+
+    checkpoint = tmp_path / "scaling_only.pth"
+    source.save_mlp_checkpoints(checkpoint)
+    saved = torch.load(checkpoint, weights_only=False)
+    assert saved["use_causal_coview_feature"] is False
+    assert saved["use_causal_coview_scaling"] is True
+    assert saved["causal_coview_groups"] == 4
+    assert saved["causal_coview_candidates"] == 32
+    assert saved["causal_coview_max_weight"] == 0.25
+
+    restored = _checkpoint_model()
+    restored.use_causal_coview_feature = False
+    restored.use_causal_coview_scaling = True
+    restored.causal_coview_groups = 4
+    restored.causal_coview_candidates = 32
+    restored.causal_coview_max_weight = 0.25
+    restored.causal_coview_scaling_prior = AffineCausalScalingPrior()
+    restored.load_mlp_checkpoints(checkpoint)
+    torch.testing.assert_close(
+        restored.causal_coview_scaling_prior.mean_blend,
+        source.causal_coview_scaling_prior.mean_blend,
     )
 
 
