@@ -2170,6 +2170,7 @@ class GaussianModel(nn.Module):
             'version': 2,
             'feat_dim': self.feat_dim,
             'n_offsets': self.n_offsets,
+            'use_feat_bank': self.use_feat_bank,
             'coview_target': self.coview_target,
             'coview_feature_mode': self.coview_feature_mode,
             'use_causal_coview_feature': self.use_causal_coview_feature,
@@ -2182,7 +2183,16 @@ class GaussianModel(nn.Module):
             'view_topology_view_candidates': self.view_topology_view_candidates,
             'grid_mlp': self.mlp_grid.state_dict(),
             'deform_mlp': self.mlp_deform.state_dict(),
+            'renderer_mlps': {
+                'opacity': self.mlp_opacity.state_dict(),
+                'covariance': self.mlp_cov.state_dict(),
+                'color': self.mlp_color.state_dict(),
+            },
         }
+        if self.use_feat_bank:
+            entropy_context['renderer_mlps']['feature_bank'] = (
+                self.mlp_feature_bank.state_dict()
+            )
         if self.entropy_extension_enabled:
             coview_model_path = os.path.join(pre_path_name, 'coview_model.bin')
             coview_model_metadata = serialize_named_tensors(
@@ -2430,6 +2440,7 @@ class GaussianModel(nn.Module):
             'version': 2,
             'feat_dim': self.feat_dim,
             'n_offsets': self.n_offsets,
+            'use_feat_bank': self.use_feat_bank,
             'coview_target': self.coview_target,
             'coview_feature_mode': self.coview_feature_mode,
             'use_causal_coview_feature': self.use_causal_coview_feature,
@@ -2450,6 +2461,7 @@ class GaussianModel(nn.Module):
                 "causal_coview_groups": 4,
                 "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
+                "use_feat_bank": False,
             }
             saved_value = entropy_context.get(key, legacy_defaults.get(key))
             if saved_value != expected:
@@ -2459,6 +2471,15 @@ class GaussianModel(nn.Module):
                 )
         self.mlp_grid.load_state_dict(entropy_context['grid_mlp'])
         self.mlp_deform.load_state_dict(entropy_context['deform_mlp'])
+        renderer_mlps = entropy_context.get('renderer_mlps')
+        if renderer_mlps is not None:
+            self.mlp_opacity.load_state_dict(renderer_mlps['opacity'])
+            self.mlp_cov.load_state_dict(renderer_mlps['covariance'])
+            self.mlp_color.load_state_dict(renderer_mlps['color'])
+            if self.use_feat_bank:
+                self.mlp_feature_bank.load_state_dict(
+                    renderer_mlps['feature_bank']
+                )
         if self.entropy_extension_enabled:
             if 'coview_model_file' in entropy_context:
                 coview_model_path = os.path.join(
