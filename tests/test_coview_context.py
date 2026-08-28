@@ -315,6 +315,10 @@ def test_legacy_camera_package_remains_decodable():
 
 def test_raw_camera_package_round_trip_and_checksum(tmp_path):
     cameras = [_camera("b", 1), _camera("a", 0)]
+    cameras[0].full_proj_transform = torch.arange(
+        16, dtype=torch.float32
+    ).reshape(4, 4).T
+    assert not cameras[0].full_proj_transform.is_contiguous()
     path = tmp_path / "camera_geometry.bin"
     metadata = serialize_camera_geometry(cameras, path)
     restored = deserialize_camera_geometry(path, metadata)
@@ -330,6 +334,8 @@ def test_raw_camera_package_round_trip_and_checksum(tmp_path):
         torch.testing.assert_close(
             before.world_view_transform, after.world_view_transform
         )
+        assert after.full_proj_transform.is_contiguous()
+        assert after.world_view_transform.is_contiguous()
         assert before.znear == after.znear
         assert before.zfar == after.zfar
 

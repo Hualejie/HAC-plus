@@ -2404,6 +2404,15 @@ class GaussianModel(nn.Module):
                 self._view_topology_cameras,
                 os.path.join(pre_path_name, camera_geometry_file),
             )
+            # Build the encoder graph from the exact contiguous camera state
+            # reconstructed by a standalone decoder.  The training camera
+            # matrices can be non-contiguous transpose views; equal values
+            # with different strides may otherwise select a different GPU
+            # matmul path close to a graph-ranking tie.
+            self._view_topology_cameras = deserialize_camera_geometry(
+                os.path.join(pre_path_name, camera_geometry_file),
+                camera_geometry_metadata,
+            )
             entropy_context.update({
                 'coview_model_file': 'coview_model.bin',
                 'coview_model_metadata': coview_model_metadata,
