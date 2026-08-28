@@ -6,7 +6,9 @@ It mirrors the anchor filtering, quantisation, and canonical sorting performed b
 """
 
 from dataclasses import dataclass
+import hashlib
 import heapq
+import struct
 from types import SimpleNamespace
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
@@ -60,6 +62,7 @@ class ViewTopologyContext:
 
 VIEW_TOPOLOGY_FEATURE_DIM = 15
 VIEW_TOPOLOGY_CANDIDATE_MODES = ("spatial", "hybrid")
+CAMERA_GEOMETRY_MAGIC = b"CVCAM001"
 
 
 def canonicalize_codec_anchors(
@@ -215,6 +218,99 @@ def camera_geometry_from_state(state) -> Tuple[SimpleNamespace, ...]:
     return extract_camera_geometry([
         SimpleNamespace(**dict(item)) for item in state
     ])
+
+
+def serialize_camera_geometry(cameras: Sequence, path) -> Dict[str, object]:
+    """Write canonical camera geometry without pickle or tensor-header overhead."""
+    geometry = extract_camera_geometry(cameras)
+    if not geometry:
+        raise ValueError("at least one camera is required for CoView geometry")
+    payload = bytearray(struct.pack("<8sI", CAMERA_GEOMETRY_MAGIC, len(geometry)))
+    for camera in geometry:
+        for matrix in (
+            camera.full_proj_transform,
+            camera.world_view_transform,
+        ):
+            array = np.asarray(
+                torch.as_tensor(matrix).detach().cpu(), dtype="<f4"
+            ).reshape(4, 4)
+            payload.extend(array.tobytes(order="C"))
+        payload.extend(struct.pack(
+            "<IIdd",
+            camera.image_width,
+            camera.image_height,
+            camera.znear,
+            camera.zfar,
+        ))
+    payload = bytes(payload)
+    with open(path, "wb") as handle:
+        handle.write(payload)
+    return {
+        "format": "raw_v1",
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "count": len(geometry),
+    }
+
+
+def deserialize_camera_geometry(path, metadata) -> Tuple[SimpleNamespace, ...]:
+    """Read and verify a raw-v1 decoder camera package."""
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    if metadata.get("format") != "raw_v1":
+        raise RuntimeError(
+            f"unsupported camera geometry format {metadata.get('format')!r}"
+        )
+    actual = {
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    for key, value in actual.items():
+        if metadata.get(key) != value:
+            raise RuntimeError(
+                f"camera geometry {key} mismatch: {value!r} != {metadata.get(key)!r}"
+            )
+    header_size = struct.calcsize("<8sI")
+    if len(payload) < header_size:
+        raise RuntimeError("camera geometry payload is truncated")
+    magic, count = struct.unpack_from("<8sI", payload, 0)
+    if magic != CAMERA_GEOMETRY_MAGIC:
+        raise RuntimeError("camera geometry magic mismatch")
+    if count != metadata.get("count"):
+        raise RuntimeError(
+            f"camera geometry count mismatch: {count} != {metadata.get('count')}"
+        )
+    matrix_bytes = 16 * np.dtype("<f4").itemsize
+    scalar_size = struct.calcsize("<IIdd")
+    record_size = 2 * matrix_bytes + scalar_size
+    if len(payload) != header_size + count * record_size:
+        raise RuntimeError("camera geometry payload length is inconsistent")
+    cameras = []
+    offset = header_size
+    for index in range(count):
+        matrices = []
+        for _ in range(2):
+            array = np.frombuffer(
+                payload, dtype="<f4", count=16, offset=offset
+            ).copy().reshape(4, 4)
+            matrices.append(torch.from_numpy(array))
+            offset += matrix_bytes
+        width, height, znear, zfar = struct.unpack_from(
+            "<IIdd", payload, offset
+        )
+        offset += scalar_size
+        cameras.append(SimpleNamespace(
+            image_name=f"camera_{index:08d}",
+            colmap_id=index,
+            uid=index,
+            full_proj_transform=matrices[0],
+            world_view_transform=matrices[1],
+            image_width=width,
+            image_height=height,
+            znear=znear,
+            zfar=zfar,
+        ))
+    return extract_camera_geometry(cameras)
 
 
 def build_geometry_observations(

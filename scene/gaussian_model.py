@@ -46,9 +46,11 @@ from scene.coview_context import (
     VIEW_TOPOLOGY_FEATURE_DIM,
     ViewTopologyContext,
     build_view_topology_context,
+    deserialize_camera_geometry,
     camera_geometry_from_state,
     camera_geometry_state,
     extract_camera_geometry,
+    serialize_camera_geometry,
 )
 from scene.coview_causal_context import (
     AffineCausalFeaturePrior,
@@ -2397,10 +2399,16 @@ class GaussianModel(nn.Module):
             # decoder reconstructs, including for FP16 and INT8 packages.
             self.install_coview_serializable_state(serialized_state)
             coview_model_bits = coview_model_metadata['bytes'] * 8
+            camera_geometry_file = 'camera_geometry.bin'
+            camera_geometry_metadata = serialize_camera_geometry(
+                self._view_topology_cameras,
+                os.path.join(pre_path_name, camera_geometry_file),
+            )
             entropy_context.update({
                 'coview_model_file': 'coview_model.bin',
                 'coview_model_metadata': coview_model_metadata,
-                'camera_geometry': camera_geometry_state(self._view_topology_cameras),
+                'camera_geometry_file': camera_geometry_file,
+                'camera_geometry_metadata': camera_geometry_metadata,
             })
             if self.coview_enabled:
                 topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
@@ -2731,9 +2739,17 @@ class GaussianModel(nn.Module):
                     self.coview_gates[attribute].data.copy_(
                         entropy_context['coview_gates'][attribute]
                     )
-            self._view_topology_cameras = camera_geometry_from_state(
-                entropy_context['camera_geometry']
-            )
+            if 'camera_geometry_file' in entropy_context:
+                self._view_topology_cameras = deserialize_camera_geometry(
+                    os.path.join(
+                        pre_path_name, entropy_context['camera_geometry_file']
+                    ),
+                    entropy_context['camera_geometry_metadata'],
+                )
+            else:
+                self._view_topology_cameras = camera_geometry_from_state(
+                    entropy_context['camera_geometry']
+                )
 
         xyz_decoded_list = []
         feat_decoded_list = []

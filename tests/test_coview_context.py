@@ -15,8 +15,10 @@ from scene.coview_context import (
     canonicalize_codec_anchors,
     coview_lsh_candidates,
     coview_topk,
+    deserialize_camera_geometry,
     pair_geometric_view_scores,
     pair_distance_depth_scores,
+    serialize_camera_geometry,
     spatial_topk,
     spatial_topk_queries,
 )
@@ -309,6 +311,31 @@ def test_legacy_camera_package_remains_decodable():
     } for camera in cameras)
     restored = camera_geometry_from_state(legacy)
     assert [camera.image_name for camera in restored] == ["a", "b"]
+
+
+def test_raw_camera_package_round_trip_and_checksum(tmp_path):
+    cameras = [_camera("b", 1), _camera("a", 0)]
+    path = tmp_path / "camera_geometry.bin"
+    metadata = serialize_camera_geometry(cameras, path)
+    restored = deserialize_camera_geometry(path, metadata)
+
+    assert metadata["format"] == "raw_v1"
+    assert metadata["bytes"] == 12 + 2 * 152
+    for before, after in zip(
+        sorted(cameras, key=lambda camera: camera.image_name), restored
+    ):
+        torch.testing.assert_close(
+            before.full_proj_transform, after.full_proj_transform
+        )
+        torch.testing.assert_close(
+            before.world_view_transform, after.world_view_transform
+        )
+        assert before.znear == after.znear
+        assert before.zfar == after.zfar
+
+    path.write_bytes(path.read_bytes()[:-1] + b"x")
+    with np.testing.assert_raises_regex(RuntimeError, "sha256 mismatch"):
+        deserialize_camera_geometry(path, metadata)
 
 
 def test_distance_depth_fast_path_matches_full_geometric_scores():
