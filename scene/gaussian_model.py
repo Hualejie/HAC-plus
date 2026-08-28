@@ -552,11 +552,11 @@ class GaussianModel(nn.Module):
 
     @property
     def causal_coview_enabled(self):
-        return self.use_causal_coview_feature
+        return getattr(self, "use_causal_coview_feature", False)
 
     @property
     def uses_view_geometry(self):
-        return self.use_view_topology or self.use_causal_coview_feature
+        return self.use_view_topology or self.causal_coview_enabled
 
     @property
     def entropy_extension_enabled(self):
@@ -1034,9 +1034,11 @@ class GaussianModel(nn.Module):
                 "view_topology_candidate_mode": self.view_topology_candidate_mode,
                 "view_topology_view_candidates": self.view_topology_view_candidates,
                 "coview_feature_mode": self.coview_feature_mode,
-                "use_causal_coview_feature": self.use_causal_coview_feature,
-                "causal_coview_groups": self.causal_coview_groups,
-                "causal_coview_max_weight": self.causal_coview_max_weight,
+                "use_causal_coview_feature": self.causal_coview_enabled,
+                "causal_coview_groups": getattr(self, "causal_coview_groups", 4),
+                "causal_coview_max_weight": getattr(
+                    self, "causal_coview_max_weight", 0.25
+                ),
             },
             "gaussian_parameters": {
                 name: {
@@ -1077,9 +1079,11 @@ class GaussianModel(nn.Module):
             "view_topology_candidate_mode": self.view_topology_candidate_mode,
             "view_topology_view_candidates": self.view_topology_view_candidates,
             "coview_feature_mode": self.coview_feature_mode,
-            "use_causal_coview_feature": self.use_causal_coview_feature,
-            "causal_coview_groups": self.causal_coview_groups,
-            "causal_coview_max_weight": self.causal_coview_max_weight,
+            "use_causal_coview_feature": self.causal_coview_enabled,
+            "causal_coview_groups": getattr(self, "causal_coview_groups", 4),
+            "causal_coview_max_weight": getattr(
+                self, "causal_coview_max_weight", 0.25
+            ),
         }
         for key, value in expected.items():
             legacy_defaults = {
