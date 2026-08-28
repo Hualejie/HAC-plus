@@ -1086,6 +1086,10 @@ class GaussianModel(nn.Module):
                 f"unsupported training checkpoint version {state.get('version')!r}"
             )
         architecture = state["architecture"]
+        branching_to_causal = (
+            self.causal_coview_enabled
+            and not architecture.get("use_causal_coview_feature", False)
+        )
         expected = {
             "feat_dim": self.feat_dim,
             "n_offsets": self.n_offsets,
@@ -1116,6 +1120,13 @@ class GaussianModel(nn.Module):
                 "causal_coview_max_weight": 0.25,
             }
             saved_value = architecture.get(key, legacy_defaults.get(key))
+            if branching_to_causal and key in {
+                "use_causal_coview_feature",
+                "causal_coview_groups",
+                "causal_coview_candidates",
+                "causal_coview_max_weight",
+            }:
+                continue
             if saved_value != value:
                 raise RuntimeError(
                     f"training checkpoint {key} mismatch: "
@@ -1146,7 +1157,22 @@ class GaussianModel(nn.Module):
         for name, tensor in state["training_buffers"].items():
             setattr(self, name, tensor)
         self.percent_dense = state["percent_dense"]
-        self.optimizer.load_state_dict(state["optimizer"])
+        optimizer_state = state["optimizer"]
+        if branching_to_causal:
+            current_optimizer_state = self.optimizer.state_dict()
+            saved_group_count = len(optimizer_state["param_groups"])
+            if saved_group_count + 1 != len(current_optimizer_state["param_groups"]):
+                raise RuntimeError(
+                    "cannot branch checkpoint to causal CoView: unexpected "
+                    "optimizer parameter-group layout"
+                )
+            optimizer_state = {
+                "state": optimizer_state["state"],
+                "param_groups": list(optimizer_state["param_groups"]) + [
+                    current_optimizer_state["param_groups"][-1]
+                ],
+            }
+        self.optimizer.load_state_dict(optimizer_state)
         self._training_view_topology = None
         self._training_view_topology_diagnostics = None
         self._training_causal_graph = None
