@@ -77,12 +77,24 @@ def main():
     )
     model.eval()
     log = model.conduct_decoding(os.path.abspath(args.bitstream))
+    feature_symbol_index_checksum = None
+    if model.causal_coview_enabled:
+        q_feature = torch.cat([
+            model.feature_quantization_steps(
+                model._anchor[start:start + 3000]
+            )
+            for start in range(0, model._anchor.shape[0], 3000)
+        ], dim=0)
+        feature_symbol_index_checksum = _checksum(
+            torch.round(model._anchor_feat / q_feature).to(torch.int32)
+        )
     result = {
         "coview_target": args.coview_target,
         "use_causal_coview_feature": args.use_causal_coview_feature,
         "num_anchors": int(model._anchor.shape[0]),
         "anchor_checksum": _checksum(model._anchor),
         "feature_checksum": _checksum(model._anchor_feat),
+        "feature_symbol_index_checksum": feature_symbol_index_checksum,
         "scaling_checksum": _checksum(model._scaling),
         "offset_checksum": _checksum(model._offset),
         "mask_checksum": _checksum(model._mask),

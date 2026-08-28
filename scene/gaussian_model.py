@@ -2159,12 +2159,22 @@ class GaussianModel(nn.Module):
         bit_offsets_list = []
 
         if self.causal_coview_enabled:
+            t_feature_0 = get_time()
             q_feature_all = torch.cat([
                 self.feature_quantization_steps(_anchor[start:start + MAX_batch_size])
                 for start in range(0, N, MAX_batch_size)
             ], dim=0)
             causal_symbols = STE_multistep.apply(
                 _feat, q_feature_all, self._anchor_feat.mean()
+            )
+            entropy_context['causal_feature_symbol_index_checksum'] = (
+                self._view_topology_checksum(
+                    torch.round(causal_symbols / q_feature_all).to(torch.int32)
+                )
+            )
+            torch.save(
+                entropy_context,
+                os.path.join(pre_path_name, 'entropy_context.pth'),
             )
             causal_result = encode_causal_feature_symbols(
                 self,
@@ -2178,6 +2188,7 @@ class GaussianModel(nn.Module):
                 topology_features=topology_features,
             )
             bit_feat_list.append(causal_result['coder_bits'])
+            t_feature += get_time() - t_feature_0
 
         hash_b_name = os.path.join(pre_path_name, 'hash.b')
         masks_b_name = os.path.join(pre_path_name, 'masks.b')
@@ -2486,6 +2497,18 @@ class GaussianModel(nn.Module):
                 batch_size=MAX_batch_size,
                 topology_features=topology_features,
             )
+            decoded_symbol_index_checksum = self._view_topology_checksum(
+                torch.round(causal_feat_decoded / q_feature_all).to(torch.int32)
+            )
+            expected_symbol_index_checksum = entropy_context[
+                'causal_feature_symbol_index_checksum'
+            ]
+            if decoded_symbol_index_checksum != expected_symbol_index_checksum:
+                raise RuntimeError(
+                    "causal Feature symbol-index checksum mismatch: "
+                    f"{decoded_symbol_index_checksum} != "
+                    f"{expected_symbol_index_checksum}"
+                )
             t_feature += get_time() - t_feature_0
 
         for s in range(steps):
