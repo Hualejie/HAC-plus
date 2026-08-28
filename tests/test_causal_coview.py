@@ -7,6 +7,7 @@ from scene.coview_causal_context import (
     CausalFeaturePrior,
     build_causal_anchor_graph,
     causal_neighbor_statistics,
+    isolated_causal_rate,
 )
 from scene.coview_context import ViewTopologyContext
 
@@ -146,3 +147,17 @@ def test_affine_scaling_prior_is_small_and_support_gated():
     assert torch.all(weight[0] == 0)
     assert torch.all(weight[1] > 0)
     assert torch.all(weight <= 0.25)
+
+
+def test_isolated_causal_rate_preserves_value_and_separates_gradients():
+    base_parameter = torch.tensor(2.0, requires_grad=True)
+    prior_parameter = torch.tensor(3.0, requires_grad=True)
+    base_rate = base_parameter.square()
+    causal_rate = (base_parameter.detach() + prior_parameter).square()
+
+    rate = isolated_causal_rate(base_rate, causal_rate)
+    torch.testing.assert_close(rate, causal_rate.detach())
+    rate.backward()
+
+    torch.testing.assert_close(base_parameter.grad, torch.tensor(4.0))
+    torch.testing.assert_close(prior_parameter.grad, torch.tensor(10.0))

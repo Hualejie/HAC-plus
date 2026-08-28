@@ -26,6 +26,15 @@ class CausalAnchorGraph:
     diagnostics: Dict[str, object]
 
 
+def isolated_causal_rate(base_rate, causal_rate):
+    """Use causal values while keeping independent base/prior gradients.
+
+    Callers must construct ``causal_rate`` from detached representation and
+    base-predictor inputs so its gradient reaches only the causal prior.
+    """
+    return base_rate + causal_rate - base_rate.detach()
+
+
 def build_causal_anchor_graph(
     topology: ViewTopologyContext,
     num_groups: int = 4,

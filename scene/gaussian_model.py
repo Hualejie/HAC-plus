@@ -70,6 +70,7 @@ bit2MB_scale = 8 * 1024 * 1024
 MAX_batch_size = 3000
 COVIEW_TARGETS = ("none", "feature", "scaling", "offset", "all")
 COVIEW_FEATURE_MODES = ("full", "chunk")
+CAUSAL_COVIEW_GRADIENT_MODES = ("joint", "isolated")
 CAUSAL_PRIOR_BLOB_KEYS = {
     "mean_blend": "m",
     "log_scale_blend": "s",
@@ -305,6 +306,7 @@ class GaussianModel(nn.Module):
                  causal_coview_max_weight: float=0.25,
                  causal_coview_gate_init: float=4.0,
                  causal_coview_camera_count: int=0,
+                 causal_coview_gradient_mode: str="joint",
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -367,6 +369,13 @@ class GaussianModel(nn.Module):
         self.causal_coview_camera_count = int(causal_coview_camera_count)
         if self.causal_coview_camera_count < 0:
             raise ValueError("causal_coview_camera_count must be non-negative")
+        if causal_coview_gradient_mode not in CAUSAL_COVIEW_GRADIENT_MODES:
+            raise ValueError(
+                "causal_coview_gradient_mode must be one of "
+                f"{CAUSAL_COVIEW_GRADIENT_MODES}, got "
+                f"{causal_coview_gradient_mode!r}"
+            )
+        self.causal_coview_gradient_mode = causal_coview_gradient_mode
         if self.use_causal_coview_feature and self.feat_dim != 50:
             raise ValueError("causal CoView Feature currently requires feat_dim=50")
         if self.causal_coview_enabled and self.causal_coview_groups < 2:
@@ -1221,6 +1230,9 @@ class GaussianModel(nn.Module):
                     self, "causal_coview_camera_count", 0
                 ),
                 "causal_coview_camera_selection": CAMERA_PROTOTYPE_SELECTION,
+                "causal_coview_gradient_mode": getattr(
+                    self, "causal_coview_gradient_mode", "joint"
+                ),
             },
             "gaussian_parameters": {
                 name: {
@@ -1281,6 +1293,9 @@ class GaussianModel(nn.Module):
                 self, "causal_coview_camera_count", 0
             ),
             "causal_coview_camera_selection": CAMERA_PROTOTYPE_SELECTION,
+            "causal_coview_gradient_mode": getattr(
+                self, "causal_coview_gradient_mode", "joint"
+            ),
         }
         for key, value in expected.items():
             legacy_defaults = {
@@ -1294,6 +1309,7 @@ class GaussianModel(nn.Module):
                 "causal_coview_max_weight": 0.25,
                 "causal_coview_camera_count": 0,
                 "causal_coview_camera_selection": CAMERA_PROTOTYPE_SELECTION,
+                "causal_coview_gradient_mode": "joint",
             }
             saved_value = architecture.get(key, legacy_defaults.get(key))
             if branching_to_causal and key in {
@@ -1304,6 +1320,7 @@ class GaussianModel(nn.Module):
                 "causal_coview_max_weight",
                 "causal_coview_camera_count",
                 "causal_coview_camera_selection",
+                "causal_coview_gradient_mode",
             }:
                 continue
             if saved_value != value:

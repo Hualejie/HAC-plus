@@ -19,7 +19,7 @@ from einops import repeat
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
-from scene.coview_causal_context import mixture_moments
+from scene.coview_causal_context import isolated_causal_rate, mixture_moments
 from utils.encodings import STE_binary, STE_multistep
 
 
@@ -157,11 +157,22 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
                 scaling_neighbor_mean, scaling_neighbor_std, scaling_support = (
                     pc.training_causal_scaling_statistics(choose_idx)
                 )
+                isolated_gradient = (
+                    pc.causal_coview_gradient_mode == "isolated"
+                )
+                prior_mean = (
+                    mean_scaling.detach() if isolated_gradient else mean_scaling
+                )
+                prior_scale = torch.clamp(
+                    scale_scaling.detach() if isolated_gradient else scale_scaling,
+                    min=1e-9,
+                )
+                prior_q = Q_scaling.detach() if isolated_gradient else Q_scaling
                 causal_scaling_mean, causal_scaling_scale, causal_scaling_weight = (
                     pc.causal_coview_scaling_prior(
-                        mean_scaling,
-                        torch.clamp(scale_scaling, min=1e-9),
-                        Q_scaling,
+                        prior_mean,
+                        prior_scale,
+                        prior_q,
                         scaling_neighbor_mean,
                         scaling_neighbor_std,
                         scaling_support,
@@ -170,14 +181,37 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
                 causal_scaling_weight = torch.clamp(
                     causal_scaling_weight, min=0.0, max=1.0 - 1e-6
                 )
-                bit_scaling = pc.EG_mix_prob_2.forward(
-                    grid_scaling_chosen,
-                    mean_scaling, causal_scaling_mean,
-                    scale_scaling, causal_scaling_scale,
+                causal_bit_scaling = pc.EG_mix_prob_2.forward(
+                    (
+                        grid_scaling_chosen.detach()
+                        if isolated_gradient else grid_scaling_chosen
+                    ),
+                    prior_mean, causal_scaling_mean,
+                    prior_scale, causal_scaling_scale,
                     1.0 - causal_scaling_weight, causal_scaling_weight,
-                    Q=Q_scaling,
-                    x_mean=pc.get_scaling.mean(),
+                    Q=prior_q,
+                    x_mean=(
+                        pc.get_scaling.mean().detach()
+                        if isolated_gradient else pc.get_scaling.mean()
+                    ),
                 )
+                if isolated_gradient:
+                    base_bit_scaling = pc.entropy_gaussian.forward(
+                        grid_scaling_chosen,
+                        mean_scaling,
+                        scale_scaling,
+                        Q_scaling,
+                        pc.get_scaling.mean(),
+                    )
+                    # Forward value is the real causal rate.  The base HAC++
+                    # representation receives exactly its original Gaussian
+                    # rate gradient, while only the causal prior receives the
+                    # conditional-rate gradient.
+                    bit_scaling = isolated_causal_rate(
+                        base_bit_scaling, causal_bit_scaling
+                    )
+                else:
+                    bit_scaling = causal_bit_scaling
             else:
                 bit_scaling = pc.entropy_gaussian.forward(
                     grid_scaling_chosen, mean_scaling, scale_scaling,
