@@ -125,11 +125,43 @@ def optimize_prior(model, prior, fixed, graph, pretrain_schedule, schedule, args
             values.append(float(bits.cpu()))
         return sum(values) / validation_indices.numel() / model.feat_dim
 
+    @torch.no_grad()
+    def expert_validation_bps():
+        total_bits = 0.0
+        total_symbols = 0.0
+        for start in range(0, validation_indices.numel(), args.batch_size):
+            indices = validation_indices[start:start + args.batch_size]
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                fixed["symbols"], neighbors, weights, indices
+            )
+            bits, symbol_count = causal_expert_rate_bits(
+                model,
+                prior,
+                fixed["symbols"][indices],
+                fixed["q_feature"][indices],
+                fixed["anchors"][indices],
+                neighbor_mean,
+                neighbor_std,
+                support[indices],
+            )
+            total_bits += float(bits.cpu())
+            total_symbols += float(symbol_count.cpu())
+        return total_bits / max(total_symbols, 1.0)
+
     prior.train()
     pretrain_optimizer = torch.optim.Adam(
         prior.parameters(), lr=args.pretrain_lr, eps=1e-15
     )
     pretrain_losses = []
+    prior.eval()
+    initial_expert_validation_bps = expert_validation_bps()
+    best_expert_validation_bps = initial_expert_validation_bps
+    best_pretrain_step = 0
+    best_expert_state = {
+        name: value.detach().cpu().clone()
+        for name, value in prior.state_dict().items()
+    }
+    prior.train()
     for step, cpu_indices in enumerate(pretrain_schedule):
         indices = torch.as_tensor(cpu_indices, device="cuda", dtype=torch.long)
         with torch.no_grad():
@@ -149,15 +181,33 @@ def optimize_prior(model, prior, fixed, graph, pretrain_schedule, schedule, args
         loss = bits / torch.clamp(symbol_count, min=1.0)
         pretrain_optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(prior.parameters(), max_norm=1.0)
         pretrain_optimizer.step()
         pretrain_losses.append(float(loss.detach().cpu()))
         if step == 0 or (step + 1) % args.log_interval == 0:
+            prior.eval()
+            current_expert_validation_bps = expert_validation_bps()
+            if current_expert_validation_bps < best_expert_validation_bps:
+                best_expert_validation_bps = current_expert_validation_bps
+                best_pretrain_step = step + 1
+                best_expert_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in prior.state_dict().items()
+                }
             print(json.dumps({
                 "stage": "causal_expert_pretrain",
                 "step": step + 1,
                 "steps": len(pretrain_schedule),
                 "bits_per_supported_symbol": pretrain_losses[-1],
+                "validation_bits_per_supported_symbol": current_expert_validation_bps,
+                "best_validation_bits_per_supported_symbol": best_expert_validation_bps,
             }), flush=True)
+            prior.train()
+
+    prior.load_state_dict({
+        name: value.to(next(prior.parameters()).device)
+        for name, value in best_expert_state.items()
+    })
 
     optimizer = torch.optim.Adam(prior.parameters(), lr=args.lr, eps=1e-15)
     prior.eval()
@@ -188,6 +238,7 @@ def optimize_prior(model, prior, fixed, graph, pretrain_schedule, schedule, args
         loss = bits / indices.numel() / model.feat_dim
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(prior.parameters(), max_norm=1.0)
         optimizer.step()
         losses.append(float(loss.detach().cpu()))
         if step == 0 or (step + 1) % args.log_interval == 0:
@@ -218,6 +269,9 @@ def optimize_prior(model, prior, fixed, graph, pretrain_schedule, schedule, args
         "training_seconds": time.time() - started,
         "initial_pretrain_bps": pretrain_losses[0],
         "final_pretrain_bps": pretrain_losses[-1],
+        "initial_expert_validation_bps": initial_expert_validation_bps,
+        "best_expert_validation_bps": best_expert_validation_bps,
+        "best_pretrain_step": best_pretrain_step,
         "initial_sample_bps": losses[0],
         "final_sample_bps": losses[-1],
         "initial_validation_bps": initial_validation_bps,
@@ -235,7 +289,7 @@ def main():
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=3000)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--pretrain_lr", type=float, default=1e-3)
+    parser.add_argument("--pretrain_lr", type=float, default=1e-4)
     parser.add_argument("--pretrain_steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)

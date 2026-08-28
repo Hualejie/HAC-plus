@@ -174,11 +174,11 @@ class CausalFeaturePrior(nn.Module):
             max=5.0,
         )
         gate_logit = output[..., -1:]
-        causal_mean = neighbor_mean_chunks + mean_residual * base_scale_chunks
-        causal_scale = torch.clamp(
-            neighbor_std_chunks + 0.5 * q_chunks,
-            min=1e-9,
-        ) * torch.exp(log_scale)
+        # This is a separate Gaussian expert, but its zero-output state starts
+        # from the stable HAC++ first prior. CoView statistics enter through
+        # ``network_input`` and learn a conditional departure from that prior.
+        causal_mean = base_mean_chunks + mean_residual * base_scale_chunks
+        causal_scale = base_scale_chunks * torch.exp(log_scale)
         mixture_weight = (
             self.max_mixture_weight * torch.sigmoid(gate_logit) * chunk_support
         )
