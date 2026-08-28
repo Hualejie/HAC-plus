@@ -16,6 +16,7 @@ from utils.encodings_cuda import (
     encoder_gaussian_mixed_chunk,
 )
 from utils.entropy_models import Entropy_gaussian_mix_prob_3
+from utils.entropy_models import Entropy_gaussian
 
 
 def causal_feature_components(
@@ -104,6 +105,36 @@ def causal_feature_rate_bits(
         probabilities[0], probabilities[1], probabilities[2],
         Q=q_feature,
     ).sum()
+
+
+def causal_expert_rate_bits(
+    model,
+    causal_prior,
+    symbols,
+    q_feature,
+    anchors,
+    neighbor_mean,
+    neighbor_std,
+    support,
+):
+    """Standalone causal-expert objective used before mixture fine-tuning."""
+    mean, scale, _, _ = feature_parameters(model, anchors)
+    causal_mean, causal_scale, _ = causal_prior(
+        mean,
+        scale,
+        q_feature,
+        neighbor_mean,
+        neighbor_std,
+        support,
+    )
+    bits = Entropy_gaussian().forward(
+        symbols,
+        causal_mean,
+        causal_scale,
+        Q=q_feature,
+    )
+    valid = (support > 0).to(bits.dtype).expand_as(bits)
+    return (bits * valid).sum(), valid.sum()
 
 
 @torch.no_grad()

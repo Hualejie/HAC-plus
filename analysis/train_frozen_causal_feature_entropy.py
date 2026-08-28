@@ -17,6 +17,7 @@ if str(REPO_ROOT) in sys.path:
 sys.path.insert(0, str(REPO_ROOT))
 
 from analysis.frozen_causal_feature_codec import (
+    causal_expert_rate_bits,
     causal_feature_rate_bits,
     encode_causal_feature_symbols,
 )
@@ -91,11 +92,9 @@ def estimated_causal_bits(model, prior, fixed, graph, batch_size=CODEC_BATCH_SIZ
     return total
 
 
-def optimize_prior(model, prior, fixed, graph, schedule, args):
+def optimize_prior(model, prior, fixed, graph, pretrain_schedule, schedule, args):
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    prior.train()
-    optimizer = torch.optim.Adam(prior.parameters(), lr=args.lr, eps=1e-15)
     neighbors = graph.neighbors.to(fixed["symbols"].device)
     weights = graph.weights.to(fixed["symbols"].device)
     support = graph.support.to(fixed["symbols"].device)
@@ -126,6 +125,41 @@ def optimize_prior(model, prior, fixed, graph, schedule, args):
             values.append(float(bits.cpu()))
         return sum(values) / validation_indices.numel() / model.feat_dim
 
+    prior.train()
+    pretrain_optimizer = torch.optim.Adam(
+        prior.parameters(), lr=args.pretrain_lr, eps=1e-15
+    )
+    pretrain_losses = []
+    for step, cpu_indices in enumerate(pretrain_schedule):
+        indices = torch.as_tensor(cpu_indices, device="cuda", dtype=torch.long)
+        with torch.no_grad():
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                fixed["symbols"], neighbors, weights, indices
+            )
+        bits, symbol_count = causal_expert_rate_bits(
+            model,
+            prior,
+            fixed["symbols"][indices],
+            fixed["q_feature"][indices],
+            fixed["anchors"][indices],
+            neighbor_mean,
+            neighbor_std,
+            support[indices],
+        )
+        loss = bits / torch.clamp(symbol_count, min=1.0)
+        pretrain_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        pretrain_optimizer.step()
+        pretrain_losses.append(float(loss.detach().cpu()))
+        if step == 0 or (step + 1) % args.log_interval == 0:
+            print(json.dumps({
+                "stage": "causal_expert_pretrain",
+                "step": step + 1,
+                "steps": len(pretrain_schedule),
+                "bits_per_supported_symbol": pretrain_losses[-1],
+            }), flush=True)
+
+    optimizer = torch.optim.Adam(prior.parameters(), lr=args.lr, eps=1e-15)
     prior.eval()
     initial_validation_bps = validation_bps()
     best_validation_bps = initial_validation_bps
@@ -167,6 +201,7 @@ def optimize_prior(model, prior, fixed, graph, schedule, args):
                     for name, value in prior.state_dict().items()
                 }
             print(json.dumps({
+                "stage": "mixture_finetune",
                 "step": step + 1,
                 "steps": len(schedule),
                 "bits_per_symbol": losses[-1],
@@ -181,6 +216,8 @@ def optimize_prior(model, prior, fixed, graph, schedule, args):
     prior.eval()
     return {
         "training_seconds": time.time() - started,
+        "initial_pretrain_bps": pretrain_losses[0],
+        "final_pretrain_bps": pretrain_losses[-1],
         "initial_sample_bps": losses[0],
         "final_sample_bps": losses[-1],
         "initial_validation_bps": initial_validation_bps,
@@ -197,7 +234,9 @@ def main():
     parser.add_argument("--serialization", choices=("fp32", "fp16", "int8"), default="fp16")
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=3000)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--pretrain_lr", type=float, default=1e-3)
+    parser.add_argument("--pretrain_steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--causal_groups", type=int, default=4)
@@ -247,6 +286,10 @@ def main():
     validation_size = min(args.validation_size, permutation.size // 4)
     args.validation_indices = permutation[:validation_size]
     train_pool = permutation[validation_size:]
+    pretrain_schedule = train_pool[rng.integers(
+        0, train_pool.size,
+        size=(args.pretrain_steps, args.batch_size), dtype=np.int32,
+    )]
     schedule = train_pool[rng.integers(
         0, train_pool.size,
         size=(args.steps, args.batch_size), dtype=np.int32,
@@ -255,7 +298,9 @@ def main():
         args.causal_hidden_dim,
         max_mixture_weight=args.causal_max_mixture_weight,
     ).cuda()
-    training_metrics = optimize_prior(model, prior, fixed, graph, schedule, args)
+    training_metrics = optimize_prior(
+        model, prior, fixed, graph, pretrain_schedule, schedule, args
+    )
 
     model_path = output / "causal_feature_model.bin"
     model_metadata = serialize_named_tensors(
