@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--view_topology_view_candidates", type=int, default=16)
     parser.add_argument("--use_causal_coview_feature", action="store_true")
     parser.add_argument("--causal_coview_groups", type=int, default=4)
+    parser.add_argument("--causal_coview_candidates", type=int, default=32)
     parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
     parser.add_argument("--causal_coview_gate_init", type=float, default=4.0)
     parser.add_argument(
@@ -77,6 +78,7 @@ def main():
         coview_feature_mode=args.coview_feature_mode,
         use_causal_coview_feature=args.use_causal_coview_feature,
         causal_coview_groups=args.causal_coview_groups,
+        causal_coview_candidates=args.causal_coview_candidates,
         causal_coview_max_weight=args.causal_coview_max_weight,
         causal_coview_gate_init=args.causal_coview_gate_init,
         n_features_per_level=args.n_features,

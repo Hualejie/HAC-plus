@@ -288,6 +288,7 @@ class GaussianModel(nn.Module):
                  coview_feature_mode: str="full",
                  use_causal_coview_feature: bool=False,
                  causal_coview_groups: int=4,
+                 causal_coview_candidates: int=32,
                  causal_coview_max_weight: float=0.25,
                  causal_coview_gate_init: float=4.0,
                  ):
@@ -345,12 +346,20 @@ class GaussianModel(nn.Module):
         self.coview_feature_mode = coview_feature_mode
         self.use_causal_coview_feature = use_causal_coview_feature
         self.causal_coview_groups = int(causal_coview_groups)
+        self.causal_coview_candidates = int(causal_coview_candidates)
         self.causal_coview_max_weight = float(causal_coview_max_weight)
         self.causal_coview_gate_init = float(causal_coview_gate_init)
         if self.use_causal_coview_feature and self.feat_dim != 50:
             raise ValueError("causal CoView Feature currently requires feat_dim=50")
         if self.use_causal_coview_feature and self.causal_coview_groups < 2:
             raise ValueError("causal_coview_groups must be at least two")
+        if (
+            self.use_causal_coview_feature
+            and self.causal_coview_candidates < self.view_topology_k
+        ):
+            raise ValueError(
+                "causal_coview_candidates must be at least view_topology_k"
+            )
         if not 0.0 < self.causal_coview_max_weight <= 1.0:
             raise ValueError("causal_coview_max_weight must be in (0, 1]")
         if self.uses_view_geometry and not 0 < self.view_topology_k <= self.view_topology_candidates:
@@ -661,12 +670,13 @@ class GaussianModel(nn.Module):
         return hashlib.sha256(array.tobytes()).hexdigest()
 
     @torch.no_grad()
-    def build_view_topology_relation(self, anchor):
+    def build_view_topology_relation(self, anchor, candidate_k=None):
         if not self.uses_view_geometry:
             return None
         if not self._view_topology_cameras:
             raise RuntimeError("train-camera geometry is required for view topology")
-        required_candidates = self.view_topology_candidates
+        candidate_k = self.view_topology_candidates if candidate_k is None else candidate_k
+        required_candidates = candidate_k
         if self.view_topology_candidate_mode == "hybrid":
             required_candidates = max(
                 required_candidates,
@@ -689,7 +699,7 @@ class GaussianModel(nn.Module):
         return build_view_topology_context(
             anchor,
             self._view_topology_cameras,
-            candidate_k=self.view_topology_candidates,
+            candidate_k=candidate_k,
             topk=self.view_topology_k,
             candidate_mode=self.view_topology_candidate_mode,
             view_candidate_k=self.view_topology_view_candidates,
@@ -727,7 +737,9 @@ class GaussianModel(nn.Module):
             anchor_int = torch.round(valid_anchor / self.voxel_size)
             codec_order = calculate_morton_order(anchor_int)
             canonical_anchor = anchor_int[codec_order] * self.voxel_size
-            topology = self.build_view_topology_relation(canonical_anchor)
+            topology = self.build_view_topology_relation(
+                canonical_anchor, candidate_k=self.causal_coview_candidates
+            )
             graph = build_causal_anchor_graph(
                 topology, num_groups=self.causal_coview_groups
             )
@@ -945,7 +957,9 @@ class GaussianModel(nn.Module):
     def codec_causal_graph(self, anchor):
         if not self.causal_coview_enabled:
             return None, None
-        topology = self.build_view_topology_relation(anchor)
+        topology = self.build_view_topology_relation(
+            anchor, candidate_k=self.causal_coview_candidates
+        )
         graph = build_causal_anchor_graph(
             topology, num_groups=self.causal_coview_groups
         )
@@ -1036,6 +1050,9 @@ class GaussianModel(nn.Module):
                 "coview_feature_mode": self.coview_feature_mode,
                 "use_causal_coview_feature": self.causal_coview_enabled,
                 "causal_coview_groups": getattr(self, "causal_coview_groups", 4),
+                "causal_coview_candidates": getattr(
+                    self, "causal_coview_candidates", 32
+                ),
                 "causal_coview_max_weight": getattr(
                     self, "causal_coview_max_weight", 0.25
                 ),
@@ -1081,6 +1098,9 @@ class GaussianModel(nn.Module):
             "coview_feature_mode": self.coview_feature_mode,
             "use_causal_coview_feature": self.causal_coview_enabled,
             "causal_coview_groups": getattr(self, "causal_coview_groups", 4),
+            "causal_coview_candidates": getattr(
+                self, "causal_coview_candidates", 32
+            ),
             "causal_coview_max_weight": getattr(
                 self, "causal_coview_max_weight", 0.25
             ),
@@ -1092,6 +1112,7 @@ class GaussianModel(nn.Module):
                 "view_topology_view_candidates": 16,
                 "use_causal_coview_feature": False,
                 "causal_coview_groups": 4,
+                "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
             }
             saved_value = architecture.get(key, legacy_defaults.get(key))
@@ -1822,6 +1843,7 @@ class GaussianModel(nn.Module):
             checkpoint.update({
                 'use_causal_coview_feature': True,
                 'causal_coview_groups': self.causal_coview_groups,
+                'causal_coview_candidates': self.causal_coview_candidates,
                 'causal_coview_max_weight': self.causal_coview_max_weight,
                 'causal_coview_feature_prior': (
                     self.causal_coview_feature_prior.state_dict()
@@ -1889,6 +1911,7 @@ class GaussianModel(nn.Module):
                 raise KeyError("checkpoint is missing causal CoView Feature state")
             expected = {
                 'causal_coview_groups': self.causal_coview_groups,
+                'causal_coview_candidates': self.causal_coview_candidates,
                 'causal_coview_max_weight': self.causal_coview_max_weight,
             }
             for key, value in expected.items():
@@ -2107,6 +2130,7 @@ class GaussianModel(nn.Module):
             'coview_feature_mode': self.coview_feature_mode,
             'use_causal_coview_feature': self.use_causal_coview_feature,
             'causal_coview_groups': self.causal_coview_groups,
+            'causal_coview_candidates': self.causal_coview_candidates,
             'causal_coview_max_weight': self.causal_coview_max_weight,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
@@ -2366,6 +2390,7 @@ class GaussianModel(nn.Module):
             'coview_feature_mode': self.coview_feature_mode,
             'use_causal_coview_feature': self.use_causal_coview_feature,
             'causal_coview_groups': self.causal_coview_groups,
+            'causal_coview_candidates': self.causal_coview_candidates,
             'causal_coview_max_weight': self.causal_coview_max_weight,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
@@ -2379,6 +2404,7 @@ class GaussianModel(nn.Module):
                 "view_topology_view_candidates": 16,
                 "use_causal_coview_feature": False,
                 "causal_coview_groups": 4,
+                "causal_coview_candidates": 32,
                 "causal_coview_max_weight": 0.25,
             }
             saved_value = entropy_context.get(key, legacy_defaults.get(key))
