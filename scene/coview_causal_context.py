@@ -1,6 +1,7 @@
 """Decoder-safe causal attribute context on a deterministic CoView graph."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
@@ -300,3 +301,244 @@ class AffineCausalFeaturePrior(nn.Module):
                 FEATURE_CHUNK_DIM, dim=1
             ).reshape_as(base_mean),
         )
+
+
+def mixture_moments(means, scales, probabilities):
+    """Moment-match a Gaussian mixture for the causal expert reference."""
+    mixture_mean = sum(
+        probability * mean
+        for probability, mean in zip(probabilities, means)
+    )
+    second_moment = sum(
+        probability * (scale.square() + mean.square())
+        for probability, mean, scale in zip(probabilities, means, scales)
+    )
+    mixture_scale = torch.sqrt(torch.clamp(
+        second_moment - mixture_mean.square(), min=1e-9
+    ))
+    return mixture_mean, mixture_scale
+
+
+def causal_feature_components(
+    model,
+    causal_prior,
+    symbol_state,
+    q_feature,
+    anchors,
+    neighbor_mean,
+    neighbor_std,
+    support,
+    chunk=None,
+    topology_features=None,
+):
+    """Build the two HAC++ Feature priors plus one causal CoView prior."""
+    context = model.calc_interp_feat(anchors)
+    outputs = torch.split(
+        model.get_grid_mlp(context),
+        [
+            model.feat_dim, model.feat_dim, model.feat_dim,
+            6, 6, 3 * model.n_offsets, 3 * model.n_offsets,
+            1, 1, 1,
+        ],
+        dim=-1,
+    )
+    mean, scale, probability = outputs[:3]
+    if model.coview_enabled:
+        mean, scale = model.apply_coview_entropy_context(
+            mean, scale, topology_features, "feature"
+        )
+    mean_scale = torch.cat((mean, scale, probability), dim=-1)
+    if chunk is None:
+        mean_adjusted, scale_adjusted, probability_adjusted = (
+            model.get_deform_mlp.forward(symbol_state, mean_scale)
+        )
+        feature_slice = slice(None)
+    else:
+        mean_adjusted, scale_adjusted, probability_adjusted = (
+            model.get_deform_mlp.forward(symbol_state, mean_scale, to_dec=chunk)
+        )
+        feature_slice = slice(
+            chunk * FEATURE_CHUNK_DIM,
+            (chunk + 1) * FEATURE_CHUNK_DIM,
+        )
+    base_probabilities = torch.softmax(
+        torch.stack(
+            (probability[:, feature_slice], probability_adjusted), dim=-1
+        ),
+        dim=-1,
+    )
+    selected_means = (mean[:, feature_slice], mean_adjusted)
+    selected_scales = (
+        torch.clamp(scale[:, feature_slice], min=1e-9),
+        torch.clamp(scale_adjusted, min=1e-9),
+    )
+    mixture_mean, mixture_scale = mixture_moments(
+        selected_means,
+        selected_scales,
+        (base_probabilities[..., 0], base_probabilities[..., 1]),
+    )
+    causal_mean, causal_scale, causal_weight = causal_prior.forward_selected(
+        mixture_mean,
+        mixture_scale,
+        q_feature[:, feature_slice],
+        neighbor_mean[:, feature_slice],
+        neighbor_std[:, feature_slice],
+        support,
+        chunk_indices=None if chunk is None else (chunk,),
+    )
+    causal_weight = torch.clamp(causal_weight, min=0.0, max=1.0 - 1e-6)
+    base_mass = 1.0 - causal_weight
+    return (
+        (mean[:, feature_slice], mean_adjusted, causal_mean),
+        (
+            torch.clamp(scale[:, feature_slice], min=1e-9),
+            torch.clamp(scale_adjusted, min=1e-9),
+            torch.clamp(causal_scale, min=1e-9),
+        ),
+        (
+            base_probabilities[..., 0] * base_mass,
+            base_probabilities[..., 1] * base_mass,
+            causal_weight,
+        ),
+    )
+
+
+@torch.no_grad()
+def encode_causal_feature_symbols(
+    model,
+    causal_prior,
+    symbols,
+    q_feature,
+    anchors,
+    graph,
+    output,
+    batch_size=3000,
+    topology_features=None,
+):
+    """Encode canonical Feature symbols in decoder-safe causal groups."""
+    from utils.encodings_cuda import encoder_gaussian_mixed_chunk
+
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    neighbors = graph.neighbors.to(symbols.device)
+    weights = graph.weights.to(symbols.device)
+    support = graph.support.to(symbols.device)
+    groups = graph.groups.to(symbols.device)
+    bit_count = 0
+    for group in range(graph.diagnostics["num_groups"]):
+        group_indices = torch.nonzero(groups == group, as_tuple=False)[:, 0]
+        for batch_index, start in enumerate(range(0, group_indices.numel(), batch_size)):
+            indices = group_indices[start:start + batch_size]
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                symbols, neighbors, weights, indices
+            )
+            batch_symbols = symbols[indices]
+            batch_q = q_feature[indices]
+            batch_topology = (
+                None if topology_features is None else topology_features[indices]
+            )
+            for chunk in range(FEATURE_CHUNKS):
+                means, scales, probabilities = causal_feature_components(
+                    model,
+                    causal_prior,
+                    batch_symbols,
+                    batch_q,
+                    anchors[indices],
+                    neighbor_mean,
+                    neighbor_std,
+                    support[indices],
+                    chunk=chunk,
+                    topology_features=batch_topology,
+                )
+                feature_slice = slice(
+                    chunk * FEATURE_CHUNK_DIM,
+                    (chunk + 1) * FEATURE_CHUNK_DIM,
+                )
+                file_name = output / (
+                    f"feat_group{group}_batch{batch_index}_chunk{chunk}.b"
+                )
+                bit_count += encoder_gaussian_mixed_chunk(
+                    batch_symbols[:, feature_slice].contiguous().view(-1),
+                    [value.contiguous().view(-1) for value in means],
+                    [value.contiguous().view(-1) for value in scales],
+                    [value.contiguous().view(-1) for value in probabilities],
+                    batch_q[:, feature_slice].contiguous().view(-1),
+                    file_name=str(file_name),
+                    chunk_size=500_000,
+                )
+    stream_bytes = sum(
+        path.stat().st_size for path in output.glob("feat_group*_batch*_chunk*.b")
+    )
+    return {"coder_bits": bit_count, "stream_bytes": stream_bytes}
+
+
+@torch.no_grad()
+def decode_causal_feature_symbols(
+    model,
+    causal_prior,
+    q_feature,
+    anchors,
+    graph,
+    stream,
+    batch_size=3000,
+    topology_features=None,
+):
+    """Decode Feature groups without reading any same/future-group symbol."""
+    from utils.encodings_cuda import decoder_gaussian_mixed_chunk
+
+    stream = Path(stream)
+    decoded = torch.zeros(
+        anchors.shape[0], model.feat_dim,
+        dtype=torch.float32, device=anchors.device,
+    )
+    neighbors = graph.neighbors.to(anchors.device)
+    weights = graph.weights.to(anchors.device)
+    support = graph.support.to(anchors.device)
+    groups = graph.groups.to(anchors.device)
+    for group in range(graph.diagnostics["num_groups"]):
+        group_indices = torch.nonzero(groups == group, as_tuple=False)[:, 0]
+        for batch_index, start in enumerate(range(0, group_indices.numel(), batch_size)):
+            indices = group_indices[start:start + batch_size]
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                decoded, neighbors, weights, indices
+            )
+            batch_decoded = torch.zeros(
+                indices.numel(), model.feat_dim,
+                dtype=torch.float32, device=anchors.device,
+            )
+            batch_topology = (
+                None if topology_features is None else topology_features[indices]
+            )
+            for chunk in range(FEATURE_CHUNKS):
+                means, scales, probabilities = causal_feature_components(
+                    model,
+                    causal_prior,
+                    batch_decoded,
+                    q_feature[indices],
+                    anchors[indices],
+                    neighbor_mean,
+                    neighbor_std,
+                    support[indices],
+                    chunk=chunk,
+                    topology_features=batch_topology,
+                )
+                feature_slice = slice(
+                    chunk * FEATURE_CHUNK_DIM,
+                    (chunk + 1) * FEATURE_CHUNK_DIM,
+                )
+                file_name = stream / (
+                    f"feat_group{group}_batch{batch_index}_chunk{chunk}.b"
+                )
+                values = decoder_gaussian_mixed_chunk(
+                    [value.contiguous().view(-1) for value in means],
+                    [value.contiguous().view(-1) for value in scales],
+                    [value.contiguous().view(-1) for value in probabilities],
+                    q_feature[indices, feature_slice].contiguous().view(-1),
+                    file_name=str(file_name),
+                    chunk_size=500_000,
+                )
+                batch_decoded[:, feature_slice] = values.view(
+                    indices.numel(), FEATURE_CHUNK_DIM
+                )
+            decoded[indices] = batch_decoded
+    return decoded

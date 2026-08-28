@@ -19,6 +19,7 @@ from einops import repeat
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from scene.coview_causal_context import mixture_moments
 from utils.encodings import STE_binary, STE_multistep
 
 
@@ -109,11 +110,48 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
             binary_grid_masks_chosen = binary_grid_masks_chosen.repeat(1, 1, 3).view(-1, 3*pc.n_offsets)
 
-            bit_feat = pc.EG_mix_prob_2.forward(feat_chosen,
-                                                mean, mean_adj,
-                                                scale, scale_adj,
-                                                probs[..., 0], probs[..., 1],
-                                                Q=Q_feat, x_mean=pc._anchor_feat.mean())
+            if pc.causal_coview_enabled and pc._training_causal_graph is not None:
+                neighbor_mean, neighbor_std, causal_support = (
+                    pc.training_causal_feature_statistics(choose_idx)
+                )
+                mixture_mean, mixture_scale = mixture_moments(
+                    (mean, mean_adj),
+                    (
+                        torch.clamp(scale, min=1e-9),
+                        torch.clamp(scale_adj, min=1e-9),
+                    ),
+                    (probs[..., 0], probs[..., 1]),
+                )
+                causal_mean, causal_scale, causal_weight = (
+                    pc.causal_coview_feature_prior(
+                        mixture_mean,
+                        mixture_scale,
+                        Q_feat,
+                        neighbor_mean,
+                        neighbor_std,
+                        causal_support,
+                    )
+                )
+                causal_weight = torch.clamp(
+                    causal_weight, min=0.0, max=1.0 - 1e-6
+                )
+                base_mass = 1.0 - causal_weight
+                bit_feat = pc.EG_mix_prob_3.forward(
+                    feat_chosen,
+                    mean, mean_adj, causal_mean,
+                    scale, scale_adj, causal_scale,
+                    probs[..., 0] * base_mass,
+                    probs[..., 1] * base_mass,
+                    causal_weight,
+                    Q=Q_feat,
+                    x_mean=pc._anchor_feat.mean(),
+                )
+            else:
+                bit_feat = pc.EG_mix_prob_2.forward(feat_chosen,
+                                                    mean, mean_adj,
+                                                    scale, scale_adj,
+                                                    probs[..., 0], probs[..., 1],
+                                                    Q=Q_feat, x_mean=pc._anchor_feat.mean())
             bit_feat = bit_feat * mask_anchor_chosen
             bit_scaling = pc.entropy_gaussian.forward(grid_scaling_chosen, mean_scaling, scale_scaling, Q_scaling, pc.get_scaling.mean())
             bit_scaling = bit_scaling * mask_anchor_chosen

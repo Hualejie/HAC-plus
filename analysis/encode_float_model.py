@@ -44,6 +44,10 @@ def main():
         default="spatial",
     )
     parser.add_argument("--view_topology_view_candidates", type=int, default=16)
+    parser.add_argument("--use_causal_coview_feature", action="store_true")
+    parser.add_argument("--causal_coview_groups", type=int, default=4)
+    parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
+    parser.add_argument("--causal_coview_gate_init", type=float, default=4.0)
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -66,6 +70,10 @@ def main():
         view_topology_view_candidates=args.view_topology_view_candidates,
         coview_target=args.coview_target,
         coview_feature_mode=args.coview_feature_mode,
+        use_causal_coview_feature=args.use_causal_coview_feature,
+        causal_coview_groups=args.causal_coview_groups,
+        causal_coview_max_weight=args.causal_coview_max_weight,
+        causal_coview_gate_init=args.causal_coview_gate_init,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,
@@ -74,7 +82,7 @@ def main():
     model.load_mlp_checkpoints(str(float_path / "checkpoint.pth"))
     model.x_bound_min = torch.load(float_path / "x_bound_min.pkl")
     model.x_bound_max = torch.load(float_path / "x_bound_max.pkl")
-    if model.coview_enabled:
+    if model.entropy_extension_enabled:
         if not args.camera_context:
             raise ValueError("--camera_context is required for an active CoView target")
         context = torch.load(args.camera_context)
@@ -87,6 +95,7 @@ def main():
     )
     print(json.dumps({
         "coview_target": args.coview_target,
+        "use_causal_coview_feature": args.use_causal_coview_feature,
         "coview_serialization": args.coview_serialization,
         "encode_log": log,
     }))

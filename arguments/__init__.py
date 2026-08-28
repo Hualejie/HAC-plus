@@ -62,6 +62,10 @@ class ModelParams(ParamGroup):
         self.view_topology_view_candidates = 16
         self.coview_target = "none"
         self.coview_feature_mode = "full"
+        self.use_causal_coview_feature = False
+        self.causal_coview_groups = 4
+        self.causal_coview_max_weight = 0.25
+        self.causal_coview_gate_init = 4.0
         self._source_path = ""
         self._model_path = ""
         self._images = "images"

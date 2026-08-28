@@ -48,6 +48,9 @@ def main():
         default="spatial",
     )
     parser.add_argument("--view_topology_view_candidates", type=int, default=16)
+    parser.add_argument("--use_causal_coview_feature", action="store_true")
+    parser.add_argument("--causal_coview_groups", type=int, default=4)
+    parser.add_argument("--causal_coview_max_weight", type=float, default=0.25)
     parser.add_argument("--n_features", type=int, default=4)
     parser.add_argument("--log2", type=int, default=13)
     parser.add_argument("--log2_2D", type=int, default=15)
@@ -64,6 +67,9 @@ def main():
         view_topology_view_candidates=args.view_topology_view_candidates,
         coview_target=args.coview_target,
         coview_feature_mode=args.coview_feature_mode,
+        use_causal_coview_feature=args.use_causal_coview_feature,
+        causal_coview_groups=args.causal_coview_groups,
+        causal_coview_max_weight=args.causal_coview_max_weight,
         n_features_per_level=args.n_features,
         log2_hashmap_size=args.log2,
         log2_hashmap_size_2D=args.log2_2D,
@@ -73,6 +79,7 @@ def main():
     log = model.conduct_decoding(os.path.abspath(args.bitstream))
     result = {
         "coview_target": args.coview_target,
+        "use_causal_coview_feature": args.use_causal_coview_feature,
         "num_anchors": int(model._anchor.shape[0]),
         "anchor_checksum": _checksum(model._anchor),
         "feature_checksum": _checksum(model._anchor_feat),

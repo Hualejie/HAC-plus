@@ -25,7 +25,7 @@ from utils.general_utils import (build_scaling_rotation, get_expon_lr_func,
                                  inverse_sigmoid, strip_symmetric)
 from utils.graphics_utils import BasicPointCloud
 from utils.system_utils import mkdir_p
-from utils.entropy_models import Entropy_bernoulli, Entropy_gaussian, Entropy_factorized, Entropy_gaussian_mix_prob_2
+from utils.entropy_models import Entropy_bernoulli, Entropy_gaussian, Entropy_factorized, Entropy_gaussian_mix_prob_2, Entropy_gaussian_mix_prob_3
 
 from utils.encodings import \
     STE_binary, STE_multistep, Quantize_anchor, \
@@ -44,10 +44,19 @@ from utils.coview_serialization import (
 from scene.coview_context import (
     VIEW_TOPOLOGY_CANDIDATE_MODES,
     VIEW_TOPOLOGY_FEATURE_DIM,
+    ViewTopologyContext,
     build_view_topology_context,
     camera_geometry_from_state,
     camera_geometry_state,
     extract_camera_geometry,
+)
+from scene.coview_causal_context import (
+    AffineCausalFeaturePrior,
+    build_causal_anchor_graph,
+    causal_neighbor_statistics,
+    decode_causal_feature_symbols,
+    encode_causal_feature_symbols,
+    mixture_moments,
 )
 
 bit2MB_scale = 8 * 1024 * 1024
@@ -277,6 +286,10 @@ class GaussianModel(nn.Module):
                  view_topology_view_candidates: int=16,
                  coview_target: str="none",
                  coview_feature_mode: str="full",
+                 use_causal_coview_feature: bool=False,
+                 causal_coview_groups: int=4,
+                 causal_coview_max_weight: float=0.25,
+                 causal_coview_gate_init: float=4.0,
                  ):
         super().__init__()
         print('hash_params:', use_2D, n_features_per_level,
@@ -330,10 +343,20 @@ class GaussianModel(nn.Module):
         if coview_feature_mode == "chunk" and self.feat_dim % 10:
             raise ValueError("chunk-level Feature CoView requires feat_dim divisible by 10")
         self.coview_feature_mode = coview_feature_mode
-        if self.use_view_topology and not 0 < self.view_topology_k <= self.view_topology_candidates:
+        self.use_causal_coview_feature = use_causal_coview_feature
+        self.causal_coview_groups = int(causal_coview_groups)
+        self.causal_coview_max_weight = float(causal_coview_max_weight)
+        self.causal_coview_gate_init = float(causal_coview_gate_init)
+        if self.use_causal_coview_feature and self.feat_dim != 50:
+            raise ValueError("causal CoView Feature currently requires feat_dim=50")
+        if self.use_causal_coview_feature and self.causal_coview_groups < 2:
+            raise ValueError("causal_coview_groups must be at least two")
+        if not 0.0 < self.causal_coview_max_weight <= 1.0:
+            raise ValueError("causal_coview_max_weight must be in (0, 1]")
+        if self.uses_view_geometry and not 0 < self.view_topology_k <= self.view_topology_candidates:
             raise ValueError("require 0 < view_topology_k <= view_topology_candidates")
         if (
-            self.use_view_topology
+            self.uses_view_geometry
             and self.view_topology_candidate_mode == "hybrid"
             and self.view_topology_view_candidates <= 0
         ):
@@ -341,6 +364,9 @@ class GaussianModel(nn.Module):
         self._view_topology_cameras = tuple()
         self._training_view_topology = None
         self._training_view_topology_diagnostics = None
+        self._training_causal_graph = None
+        self._training_causal_original_to_canonical = None
+        self._training_causal_canonical_to_original = None
         self._codec_view_topology_cache = None
         self._coview_residual_stats = {}
         self._coview_residual_accumulators = {}
@@ -475,8 +501,18 @@ class GaussianModel(nn.Module):
                     "offset": nn.Parameter(torch.ones((), device="cuda")),
                 })
 
+        if self.use_causal_coview_feature:
+            self.causal_coview_feature_prior = AffineCausalFeaturePrior(
+                max_mixture_weight=self.causal_coview_max_weight
+            ).cuda()
+            with torch.no_grad():
+                self.causal_coview_feature_prior.gate_logit.fill_(
+                    self.causal_coview_gate_init
+                )
+
         self.entropy_gaussian = Entropy_gaussian(Q=1).cuda()
         self.EG_mix_prob_2 = Entropy_gaussian_mix_prob_2(Q=1).cuda()
+        self.EG_mix_prob_3 = Entropy_gaussian_mix_prob_3(Q=1).cuda()
 
     def get_encoding_params(self):
         params = []
@@ -514,6 +550,18 @@ class GaussianModel(nn.Module):
     def coview_enabled(self):
         return self.use_view_topology and bool(self.active_coview_attributes())
 
+    @property
+    def causal_coview_enabled(self):
+        return self.use_causal_coview_feature
+
+    @property
+    def uses_view_geometry(self):
+        return self.use_view_topology or self.use_causal_coview_feature
+
+    @property
+    def entropy_extension_enabled(self):
+        return self.coview_enabled or self.causal_coview_enabled
+
     def get_mlp_size_breakdown(self, digit=32):
         base_bits = 0
         for name, param in self.named_parameters():
@@ -530,6 +578,11 @@ class GaussianModel(nn.Module):
                 head = getattr(self, f"mlp_coview_{attribute}")
                 coview_bits += sum(p.numel() * digit for p in head.parameters())
                 coview_bits += self.coview_gates[attribute].numel() * digit
+        if self.causal_coview_enabled:
+            coview_bits += sum(
+                p.numel() * digit
+                for p in self.causal_coview_feature_prior.parameters()
+            )
         return {
             "base_bits": base_bits,
             "active_coview_bits": coview_bits,
@@ -542,12 +595,16 @@ class GaussianModel(nn.Module):
 
     def coview_serializable_state(self):
         state = {}
-        for name, tensor in self.mlp_coview_shared.state_dict().items():
-            state[f"shared.{name}"] = tensor
-        for attribute in self.active_coview_attributes():
-            for name, tensor in getattr(self, f"mlp_coview_{attribute}").state_dict().items():
-                state[f"head.{attribute}.{name}"] = tensor
-            state[f"gate.{attribute}"] = self.coview_gates[attribute].detach()
+        if self.coview_enabled:
+            for name, tensor in self.mlp_coview_shared.state_dict().items():
+                state[f"shared.{name}"] = tensor
+            for attribute in self.active_coview_attributes():
+                for name, tensor in getattr(self, f"mlp_coview_{attribute}").state_dict().items():
+                    state[f"head.{attribute}.{name}"] = tensor
+                state[f"gate.{attribute}"] = self.coview_gates[attribute].detach()
+        if self.causal_coview_enabled:
+            for name, tensor in self.causal_coview_feature_prior.state_dict().items():
+                state[f"causal_feature.{name}"] = tensor
         return state
 
     def install_coview_serializable_state(self, state):
@@ -558,28 +615,38 @@ class GaussianModel(nn.Module):
                 "serialized CoView state mismatch: "
                 f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
             )
-        shared_prefix = "shared."
-        device = next(self.mlp_coview_shared.parameters()).device
-        self.mlp_coview_shared.load_state_dict({
-            name[len(shared_prefix):]: tensor.to(device)
-            for name, tensor in state.items()
-            if name.startswith(shared_prefix)
-        })
-        for attribute in self.active_coview_attributes():
-            prefix = f"head.{attribute}."
-            getattr(self, f"mlp_coview_{attribute}").load_state_dict({
+        if self.coview_enabled:
+            shared_prefix = "shared."
+            device = next(self.mlp_coview_shared.parameters()).device
+            self.mlp_coview_shared.load_state_dict({
+                name[len(shared_prefix):]: tensor.to(device)
+                for name, tensor in state.items()
+                if name.startswith(shared_prefix)
+            })
+            for attribute in self.active_coview_attributes():
+                prefix = f"head.{attribute}."
+                getattr(self, f"mlp_coview_{attribute}").load_state_dict({
+                    name[len(prefix):]: tensor.to(device)
+                    for name, tensor in state.items()
+                    if name.startswith(prefix)
+                })
+                self.coview_gates[attribute].data.copy_(
+                    state[f"gate.{attribute}"].to(device)
+                )
+        if self.causal_coview_enabled:
+            prefix = "causal_feature."
+            device = next(self.causal_coview_feature_prior.parameters()).device
+            self.causal_coview_feature_prior.load_state_dict({
                 name[len(prefix):]: tensor.to(device)
                 for name, tensor in state.items()
                 if name.startswith(prefix)
             })
-            self.coview_gates[attribute].data.copy_(
-                state[f"gate.{attribute}"].to(device)
-            )
 
     def configure_view_topology_cameras(self, cameras):
-        if self.use_view_topology:
+        if self.uses_view_geometry:
             self._view_topology_cameras = extract_camera_geometry(cameras)
             self._training_view_topology = None
+            self._training_causal_graph = None
 
     @property
     def has_training_view_topology(self):
@@ -594,9 +661,9 @@ class GaussianModel(nn.Module):
         return hashlib.sha256(array.tobytes()).hexdigest()
 
     @torch.no_grad()
-    def build_view_topology_features(self, anchor):
-        if not self.use_view_topology:
-            return None, None
+    def build_view_topology_relation(self, anchor):
+        if not self.uses_view_geometry:
+            return None
         if not self._view_topology_cameras:
             raise RuntimeError("train-camera geometry is required for view topology")
         required_candidates = self.view_topology_candidates
@@ -606,20 +673,20 @@ class GaussianModel(nn.Module):
                 self.view_topology_view_candidates,
             )
         if anchor.shape[0] <= required_candidates:
-            features = torch.zeros(
-                (anchor.shape[0], VIEW_TOPOLOGY_FEATURE_DIM),
-                device=anchor.device,
-                dtype=anchor.dtype,
-            )
-            diagnostics = {
+            count = int(anchor.shape[0])
+            return ViewTopologyContext(
+                features=np.zeros((count, VIEW_TOPOLOGY_FEATURE_DIM), dtype=np.float32),
+                neighbors=np.arange(count, dtype=np.int64)[:, None],
+                distance_scores=np.zeros((count, 1), dtype=np.float32),
+                depth_scores=np.zeros((count, 1), dtype=np.float32),
+                diagnostics={
                 "num_anchors": int(anchor.shape[0]),
                 "insufficient_anchor_count": True,
                 "feature_dim": VIEW_TOPOLOGY_FEATURE_DIM,
                 "dense_anchor_pair_matrix_created": False,
-            }
-            diagnostics["feature_checksum"] = self._view_topology_checksum(features)
-            return features, diagnostics
-        topology = build_view_topology_context(
+                },
+            )
+        return build_view_topology_context(
             anchor,
             self._view_topology_cameras,
             candidate_k=self.view_topology_candidates,
@@ -627,6 +694,12 @@ class GaussianModel(nn.Module):
             candidate_mode=self.view_topology_candidate_mode,
             view_candidate_k=self.view_topology_view_candidates,
         )
+
+    @torch.no_grad()
+    def build_view_topology_features(self, anchor):
+        if not self.use_view_topology:
+            return None, None
+        topology = self.build_view_topology_relation(anchor)
         features = torch.as_tensor(topology.features, device=anchor.device, dtype=anchor.dtype)
         diagnostics = dict(topology.diagnostics)
         diagnostics["feature_checksum"] = self._view_topology_checksum(features)
@@ -634,20 +707,42 @@ class GaussianModel(nn.Module):
 
     @torch.no_grad()
     def refresh_training_view_topology(self):
-        if not self.use_view_topology:
+        if not self.uses_view_geometry:
             return
         valid = self.get_mask_anchor.to(torch.bool)[:, 0]
         valid_anchor = self.get_anchor[valid]
-        valid_features, diagnostics = self.build_view_topology_features(valid_anchor)
-        full_features = torch.zeros(
-            (self.get_anchor.shape[0], VIEW_TOPOLOGY_FEATURE_DIM),
-            device=self.get_anchor.device,
-            dtype=self.get_anchor.dtype,
-        )
-        full_features[valid] = valid_features
-        self._training_view_topology = full_features
-        self._training_view_topology_diagnostics = diagnostics
-        print(f"View topology refreshed: {diagnostics}")
+        if self.use_view_topology:
+            valid_features, diagnostics = self.build_view_topology_features(valid_anchor)
+            full_features = torch.zeros(
+                (self.get_anchor.shape[0], VIEW_TOPOLOGY_FEATURE_DIM),
+                device=self.get_anchor.device,
+                dtype=self.get_anchor.dtype,
+            )
+            full_features[valid] = valid_features
+            self._training_view_topology = full_features
+            self._training_view_topology_diagnostics = diagnostics
+            print(f"View topology refreshed: {diagnostics}")
+        if self.causal_coview_enabled:
+            valid_original_idx = torch.nonzero(valid, as_tuple=False)[:, 0]
+            anchor_int = torch.round(valid_anchor / self.voxel_size)
+            codec_order = calculate_morton_order(anchor_int)
+            canonical_anchor = anchor_int[codec_order] * self.voxel_size
+            topology = self.build_view_topology_relation(canonical_anchor)
+            graph = build_causal_anchor_graph(
+                topology, num_groups=self.causal_coview_groups
+            )
+            canonical_to_original = valid_original_idx[codec_order]
+            original_to_canonical = torch.full(
+                (self.get_anchor.shape[0],), -1,
+                dtype=torch.long, device=self.get_anchor.device,
+            )
+            original_to_canonical[canonical_to_original] = torch.arange(
+                canonical_to_original.numel(), device=self.get_anchor.device
+            )
+            self._training_causal_graph = graph
+            self._training_causal_original_to_canonical = original_to_canonical
+            self._training_causal_canonical_to_original = canonical_to_original
+            print(f"Causal CoView graph refreshed: {graph.diagnostics}")
 
     def training_view_topology(self, anchor_selection):
         if not self.use_view_topology:
@@ -655,6 +750,76 @@ class GaussianModel(nn.Module):
         if not self.has_training_view_topology:
             raise RuntimeError("training view topology has not been built")
         return self._training_view_topology[anchor_selection]
+
+    def feature_quantization_steps(self, anchor):
+        outputs = torch.split(
+            self.get_grid_mlp(self.calc_interp_feat(anchor)),
+            [
+                self.feat_dim, self.feat_dim, self.feat_dim,
+                6, 6, 3 * self.n_offsets, 3 * self.n_offsets,
+                1, 1, 1,
+            ],
+            dim=-1,
+        )
+        return (1.0 + torch.tanh(outputs[7])).repeat(1, self.feat_dim)
+
+    def training_causal_feature_statistics(self, anchor_selection):
+        """Gather decoded-equivalent earlier-group Feature context for a sample."""
+        if not self.causal_coview_enabled:
+            raise RuntimeError("causal CoView Feature is disabled")
+        if self._training_causal_graph is None:
+            raise RuntimeError("training causal CoView graph has not been built")
+        selected_original = torch.nonzero(anchor_selection, as_tuple=False)[:, 0]
+        selected_canonical = self._training_causal_original_to_canonical[
+            selected_original
+        ]
+        output_mean = torch.zeros(
+            selected_original.numel(), self.feat_dim,
+            device=self.get_anchor.device, dtype=self._anchor_feat.dtype,
+        )
+        output_std = torch.zeros_like(output_mean)
+        output_support = torch.zeros(
+            selected_original.numel(), 1,
+            device=self.get_anchor.device, dtype=self._anchor_feat.dtype,
+        )
+        selected_valid = selected_canonical >= 0
+        if not torch.any(selected_valid):
+            return output_mean, output_std, output_support
+
+        graph = self._training_causal_graph
+        rows = selected_canonical[selected_valid].cpu()
+        neighbors = graph.neighbors[rows]
+        weights = graph.weights[rows].to(self.get_anchor.device)
+        support = graph.support[rows].to(self.get_anchor.device)
+        safe_neighbors = torch.clamp(neighbors, min=0).to(self.get_anchor.device)
+        neighbor_original = self._training_causal_canonical_to_original[
+            safe_neighbors
+        ]
+        unique_original, inverse = torch.unique(
+            neighbor_original.reshape(-1), return_inverse=True
+        )
+        neighbor_q = self.feature_quantization_steps(
+            self.get_anchor[unique_original]
+        )
+        decoded_neighbor = STE_multistep.apply(
+            self._anchor_feat[unique_original],
+            neighbor_q,
+            self._anchor_feat.mean(),
+        )
+        gathered = decoded_neighbor[inverse].view(
+            *neighbor_original.shape, self.feat_dim
+        )
+        valid_edges = (neighbors >= 0).to(self.get_anchor.device)
+        effective_weights = weights * valid_edges.to(weights.dtype)
+        mean = (gathered * effective_weights[..., None]).sum(dim=1)
+        variance = (
+            (gathered - mean[:, None, :]).square()
+            * effective_weights[..., None]
+        ).sum(dim=1)
+        output_mean[selected_valid] = mean
+        output_std[selected_valid] = torch.sqrt(torch.clamp(variance, min=0.0))
+        output_support[selected_valid] = support
+        return output_mean, output_std, output_support
 
     def apply_coview_entropy_context(self, mean, scale, topology_features, attribute):
         if attribute not in ("feature", "scaling", "offset"):
@@ -767,6 +932,28 @@ class GaussianModel(nn.Module):
         self._codec_view_topology_cache = (anchor_checksum, features, diagnostics)
         return features, diagnostics
 
+    @staticmethod
+    def _causal_graph_checksum(graph):
+        digest = hashlib.sha256()
+        for tensor in (
+            graph.groups, graph.neighbors, graph.weights, graph.support,
+        ):
+            digest.update(tensor.cpu().contiguous().numpy().tobytes())
+        return digest.hexdigest()
+
+    @torch.no_grad()
+    def codec_causal_graph(self, anchor):
+        if not self.causal_coview_enabled:
+            return None, None
+        topology = self.build_view_topology_relation(anchor)
+        graph = build_causal_anchor_graph(
+            topology, num_groups=self.causal_coview_groups
+        )
+        diagnostics = dict(graph.diagnostics)
+        diagnostics["graph_checksum"] = self._causal_graph_checksum(graph)
+        diagnostics["anchor_checksum"] = self._view_topology_checksum(anchor)
+        return graph, diagnostics
+
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
@@ -779,6 +966,8 @@ class GaussianModel(nn.Module):
             self.mlp_coview_feature.eval()
             self.mlp_coview_scaling.eval()
             self.mlp_coview_offset.eval()
+        if self.causal_coview_enabled:
+            self.causal_coview_feature_prior.eval()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
@@ -795,6 +984,8 @@ class GaussianModel(nn.Module):
             self.mlp_coview_feature.train()
             self.mlp_coview_scaling.train()
             self.mlp_coview_offset.train()
+        if self.causal_coview_enabled:
+            self.causal_coview_feature_prior.train()
 
         if self.use_feat_bank:
             self.mlp_feature_bank.train()
@@ -818,6 +1009,8 @@ class GaussianModel(nn.Module):
                 "mlp_coview_offset": self.mlp_coview_offset,
                 "coview_gates": self.coview_gates,
             })
+        if self.causal_coview_enabled:
+            modules["causal_coview_feature_prior"] = self.causal_coview_feature_prior
         return modules
 
     def training_checkpoint_state(self):
@@ -841,6 +1034,9 @@ class GaussianModel(nn.Module):
                 "view_topology_candidate_mode": self.view_topology_candidate_mode,
                 "view_topology_view_candidates": self.view_topology_view_candidates,
                 "coview_feature_mode": self.coview_feature_mode,
+                "use_causal_coview_feature": self.use_causal_coview_feature,
+                "causal_coview_groups": self.causal_coview_groups,
+                "causal_coview_max_weight": self.causal_coview_max_weight,
             },
             "gaussian_parameters": {
                 name: {
@@ -881,12 +1077,18 @@ class GaussianModel(nn.Module):
             "view_topology_candidate_mode": self.view_topology_candidate_mode,
             "view_topology_view_candidates": self.view_topology_view_candidates,
             "coview_feature_mode": self.coview_feature_mode,
+            "use_causal_coview_feature": self.use_causal_coview_feature,
+            "causal_coview_groups": self.causal_coview_groups,
+            "causal_coview_max_weight": self.causal_coview_max_weight,
         }
         for key, value in expected.items():
             legacy_defaults = {
                 "coview_feature_mode": "full",
                 "view_topology_candidate_mode": "spatial",
                 "view_topology_view_candidates": 16,
+                "use_causal_coview_feature": False,
+                "causal_coview_groups": 4,
+                "causal_coview_max_weight": 0.25,
             }
             saved_value = architecture.get(key, legacy_defaults.get(key))
             if saved_value != value:
@@ -922,6 +1124,9 @@ class GaussianModel(nn.Module):
         self.optimizer.load_state_dict(state["optimizer"])
         self._training_view_topology = None
         self._training_view_topology_diagnostics = None
+        self._training_causal_graph = None
+        self._training_causal_original_to_canonical = None
+        self._training_causal_canonical_to_original = None
         self._codec_view_topology_cache = None
 
     # Retain the public names for callers outside train.py, but use the fixed,
@@ -1131,6 +1336,12 @@ class GaussianModel(nn.Module):
                 'lr': training_args.mlp_coview_lr_init,
                 "name": "mlp_coview",
             })
+        if self.causal_coview_enabled:
+            l.append({
+                'params': list(self.causal_coview_feature_prior.parameters()),
+                'lr': training_args.mlp_coview_lr_init,
+                "name": "causal_coview_feature",
+            })
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -1183,7 +1394,7 @@ class GaussianModel(nn.Module):
                                                     lr_final=training_args.mlp_deform_lr_final,
                                                     lr_delay_mult=training_args.mlp_deform_lr_delay_mult,
                                                     max_steps=training_args.mlp_deform_lr_max_steps)
-        if self.use_view_topology:
+        if self.uses_view_geometry:
             self.mlp_coview_scheduler_args = get_expon_lr_func(
                 lr_init=training_args.mlp_coview_lr_init,
                 lr_final=training_args.mlp_coview_lr_final,
@@ -1231,6 +1442,9 @@ class GaussianModel(nn.Module):
                 lr = self.mlp_deform_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_coview":
+                lr = self.mlp_coview_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "causal_coview_feature":
                 lr = self.mlp_coview_scheduler_args(iteration)
                 param_group['lr'] = lr
 
@@ -1600,6 +1814,15 @@ class GaussianModel(nn.Module):
                 'coview_offset_head': self.mlp_coview_offset.state_dict(),
                 'coview_gates': self.coview_gates.state_dict(),
             })
+        if self.causal_coview_enabled:
+            checkpoint.update({
+                'use_causal_coview_feature': True,
+                'causal_coview_groups': self.causal_coview_groups,
+                'causal_coview_max_weight': self.causal_coview_max_weight,
+                'causal_coview_feature_prior': (
+                    self.causal_coview_feature_prior.state_dict()
+                ),
+            })
         torch.save(checkpoint, path)
 
 
@@ -1656,6 +1879,22 @@ class GaussianModel(nn.Module):
             self.mlp_coview_scaling.load_state_dict(checkpoint['coview_scaling_head'])
             self.mlp_coview_offset.load_state_dict(checkpoint['coview_offset_head'])
             self.coview_gates.load_state_dict(checkpoint['coview_gates'])
+        if self.causal_coview_enabled:
+            if not checkpoint.get('use_causal_coview_feature', False):
+                raise KeyError("checkpoint is missing causal CoView Feature state")
+            expected = {
+                'causal_coview_groups': self.causal_coview_groups,
+                'causal_coview_max_weight': self.causal_coview_max_weight,
+            }
+            for key, value in expected.items():
+                if checkpoint.get(key) != value:
+                    raise RuntimeError(
+                        f"causal CoView checkpoint {key} mismatch: "
+                        f"{checkpoint.get(key)!r} != {value!r}"
+                    )
+            self.causal_coview_feature_prior.load_state_dict(
+                checkpoint['causal_coview_feature_prior']
+            )
 
     def contract_to_unisphere(self,
         x: torch.Tensor,
@@ -1701,14 +1940,18 @@ class GaussianModel(nn.Module):
         hash_embeddings = self.get_encoding_params()
 
         topology_features = None
-        if self.coview_enabled:
+        causal_graph = None
+        if self.entropy_extension_enabled:
             estimate_order = calculate_morton_order(torch.round(_anchor / self.voxel_size))
             _anchor = _anchor[estimate_order]
             _feat = _feat[estimate_order]
             _grid_offsets = _grid_offsets[estimate_order]
             _scaling = _scaling[estimate_order]
             _mask = _mask[estimate_order]
-            topology_features, _ = self.codec_view_topology(_anchor)
+            if self.coview_enabled:
+                topology_features, _ = self.codec_view_topology(_anchor)
+            if self.causal_coview_enabled:
+                causal_graph, _ = self.codec_causal_graph(_anchor)
 
         feat_context = self.calc_interp_feat(_anchor)  # [N_visible_anchor*0.2, 32]
         mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
@@ -1732,11 +1975,46 @@ class GaussianModel(nn.Module):
         offsets = offsets.view(-1, 3*self.n_offsets)
         mask_tmp = _mask.repeat(1, 1, 3).view(-1, 3*self.n_offsets)
 
-        bit_feat = self.EG_mix_prob_2.forward(_feat,
-                                            mean, mean_adj,
-                                            scale, scale_adj,
-                                            probs[..., 0], probs[..., 1],
-                                            Q=Q_feat)
+        if self.causal_coview_enabled:
+            neighbors = causal_graph.neighbors.to(_feat.device)
+            weights = causal_graph.weights.to(_feat.device)
+            support = causal_graph.support.to(_feat.device)
+            neighbor_mean, neighbor_std = causal_neighbor_statistics(
+                _feat, neighbors, weights
+            )
+            mixture_mean, mixture_scale = mixture_moments(
+                (mean, mean_adj),
+                (
+                    torch.clamp(scale, min=1e-9),
+                    torch.clamp(scale_adj, min=1e-9),
+                ),
+                (probs[..., 0], probs[..., 1]),
+            )
+            causal_mean, causal_scale, causal_weight = (
+                self.causal_coview_feature_prior(
+                    mixture_mean, mixture_scale, Q_feat,
+                    neighbor_mean, neighbor_std, support,
+                )
+            )
+            causal_weight = torch.clamp(
+                causal_weight, min=0.0, max=1.0 - 1e-6
+            )
+            base_mass = 1.0 - causal_weight
+            bit_feat = self.EG_mix_prob_3.forward(
+                _feat,
+                mean, mean_adj, causal_mean,
+                scale, scale_adj, causal_scale,
+                probs[..., 0] * base_mass,
+                probs[..., 1] * base_mass,
+                causal_weight,
+                Q=Q_feat,
+            )
+        else:
+            bit_feat = self.EG_mix_prob_2.forward(_feat,
+                                                mean, mean_adj,
+                                                scale, scale_adj,
+                                                probs[..., 0], probs[..., 1],
+                                                Q=Q_feat)
 
         bit_scaling = self.entropy_gaussian.forward(grid_scaling, mean_scaling, scale_scaling, Q_scaling)
         bit_offsets = self.entropy_gaussian.forward(offsets, mean_offsets, scale_offsets, Q_offsets)
@@ -1814,6 +2092,7 @@ class GaussianModel(nn.Module):
         _mask = _mask[sorted_indices]
 
         topology_features = None
+        causal_graph = None
         coview_model_bits = 0
         entropy_context = {
             'version': 2,
@@ -1821,6 +2100,9 @@ class GaussianModel(nn.Module):
             'n_offsets': self.n_offsets,
             'coview_target': self.coview_target,
             'coview_feature_mode': self.coview_feature_mode,
+            'use_causal_coview_feature': self.use_causal_coview_feature,
+            'causal_coview_groups': self.causal_coview_groups,
+            'causal_coview_max_weight': self.causal_coview_max_weight,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
             'view_topology_candidate_mode': self.view_topology_candidate_mode,
@@ -1828,7 +2110,7 @@ class GaussianModel(nn.Module):
             'grid_mlp': self.mlp_grid.state_dict(),
             'deform_mlp': self.mlp_deform.state_dict(),
         }
-        if self.coview_enabled:
+        if self.entropy_extension_enabled:
             coview_model_path = os.path.join(pre_path_name, 'coview_model.bin')
             coview_model_metadata = serialize_named_tensors(
                 self.coview_serializable_state(),
@@ -1844,14 +2126,20 @@ class GaussianModel(nn.Module):
             # decoder reconstructs, including for FP16 and INT8 packages.
             self.install_coview_serializable_state(serialized_state)
             coview_model_bits = coview_model_metadata['bytes'] * 8
-            topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
             entropy_context.update({
                 'coview_model_file': 'coview_model.bin',
                 'coview_model_metadata': coview_model_metadata,
                 'camera_geometry': camera_geometry_state(self._view_topology_cameras),
-                'topology_feature_checksum': topology_diagnostics['feature_checksum'],
-                'topology_diagnostics': topology_diagnostics,
             })
+            if self.coview_enabled:
+                topology_features, topology_diagnostics = self.codec_view_topology(_anchor)
+                entropy_context.update({
+                    'topology_feature_checksum': topology_diagnostics['feature_checksum'],
+                    'topology_diagnostics': topology_diagnostics,
+                })
+            if self.causal_coview_enabled:
+                causal_graph, causal_diagnostics = self.codec_causal_graph(_anchor)
+                entropy_context['causal_graph_diagnostics'] = causal_diagnostics
         # The baseline also needs mlp_grid/mlp_deform in a fresh process.  A
         # resident training model is not part of the entropy-decoder contract.
         torch.save(entropy_context, os.path.join(pre_path_name, 'entropy_context.pth'))
@@ -1864,6 +2152,27 @@ class GaussianModel(nn.Module):
         bit_feat_list = []
         bit_scaling_list = []
         bit_offsets_list = []
+
+        if self.causal_coview_enabled:
+            q_feature_all = torch.cat([
+                self.feature_quantization_steps(_anchor[start:start + MAX_batch_size])
+                for start in range(0, N, MAX_batch_size)
+            ], dim=0)
+            causal_symbols = STE_multistep.apply(
+                _feat, q_feature_all, self._anchor_feat.mean()
+            )
+            causal_result = encode_causal_feature_symbols(
+                self,
+                self.causal_coview_feature_prior,
+                causal_symbols,
+                q_feature_all,
+                _anchor,
+                causal_graph,
+                pre_path_name,
+                batch_size=MAX_batch_size,
+                topology_features=topology_features,
+            )
+            bit_feat_list.append(causal_result['coder_bits'])
 
         hash_b_name = os.path.join(pre_path_name, 'hash.b')
         masks_b_name = os.path.join(pre_path_name, 'masks.b')
@@ -1882,7 +2191,8 @@ class GaussianModel(nn.Module):
 
             anchor_slice = _anchor[N_start:N_end]
 
-            # encode feat
+            # Derive all attribute priors. Causal Feature itself was encoded
+            # group-wise above; Scaling/Offset remain batch-parallel.
             feat_context = self.calc_interp_feat(anchor_slice)  # [N_num, ?]
             # many [N_num, ?]
             mean, scale, prob, mean_scaling, scale_scaling, mean_offsets, scale_offsets, Q_feat_adj, Q_scaling_adj, Q_offsets_adj = \
@@ -1907,33 +2217,34 @@ class GaussianModel(nn.Module):
             Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
             Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
 
-            feat = _feat[N_start:N_end]
-            feat = STE_multistep.apply(feat, Q_feat, self._anchor_feat.mean())
-            torch.cuda.synchronize(); t0 = time.time()
+            if not self.causal_coview_enabled:
+                feat = _feat[N_start:N_end]
+                feat = STE_multistep.apply(feat, Q_feat, self._anchor_feat.mean())
+                torch.cuda.synchronize(); t0 = time.time()
 
-            t_feature_0 = get_time()
-            mean_scale = torch.cat([mean, scale, prob], dim=-1)
-            scale = torch.clamp(scale, min=1e-9)
-            bit_feat = 0
-            for cc in range(5):
-                mean_adj, scale_adj, prob_adj = self.get_deform_mlp.forward(feat, mean_scale, to_dec=cc)
-                probs = torch.stack([prob[:, cc*10:cc*10+10], prob_adj], dim=-1)
-                probs = torch.softmax(probs, dim=-1)
+                t_feature_0 = get_time()
+                mean_scale = torch.cat([mean, scale, prob], dim=-1)
+                scale = torch.clamp(scale, min=1e-9)
+                bit_feat = 0
+                for cc in range(5):
+                    mean_adj, scale_adj, prob_adj = self.get_deform_mlp.forward(feat, mean_scale, to_dec=cc)
+                    probs = torch.stack([prob[:, cc*10:cc*10+10], prob_adj], dim=-1)
+                    probs = torch.softmax(probs, dim=-1)
 
-                feat_tmp = feat[:, cc*10:cc*10+10].contiguous().view(-1)
-                Q_feat_tmp = Q_feat[:, cc*10:cc*10+10].contiguous().view(-1)
+                    feat_tmp = feat[:, cc*10:cc*10+10].contiguous().view(-1)
+                    Q_feat_tmp = Q_feat[:, cc*10:cc*10+10].contiguous().view(-1)
 
-                bit_feat += encoder_gaussian_mixed_chunk(
-                    feat_tmp,
-                    [mean[:, cc*10:cc*10+10].contiguous().view(-1), mean_adj.contiguous().view(-1)],
-                    [scale[:, cc*10:cc*10+10].contiguous().view(-1), scale_adj.contiguous().view(-1)],
-                    [probs[..., 0].contiguous().view(-1), probs[..., 1].contiguous().view(-1)],
-                    Q_feat_tmp,
-                    file_name=feat_b_name.replace('.b', f'_{cc}.b'), chunk_size=50_0000)
-            t_feature += get_time() - t_feature_0
+                    bit_feat += encoder_gaussian_mixed_chunk(
+                        feat_tmp,
+                        [mean[:, cc*10:cc*10+10].contiguous().view(-1), mean_adj.contiguous().view(-1)],
+                        [scale[:, cc*10:cc*10+10].contiguous().view(-1), scale_adj.contiguous().view(-1)],
+                        [probs[..., 0].contiguous().view(-1), probs[..., 1].contiguous().view(-1)],
+                        Q_feat_tmp,
+                        file_name=feat_b_name.replace('.b', f'_{cc}.b'), chunk_size=50_0000)
+                t_feature += get_time() - t_feature_0
 
-            torch.cuda.synchronize(); t_codec += time.time() - t0
-            bit_feat_list.append(bit_feat)
+                torch.cuda.synchronize(); t_codec += time.time() - t0
+                bit_feat_list.append(bit_feat)
 
             t_scaling_0 = get_time()
             scaling = _scaling[N_start:N_end].view(-1)  # [N_num*6]
@@ -2037,6 +2348,9 @@ class GaussianModel(nn.Module):
             'n_offsets': self.n_offsets,
             'coview_target': self.coview_target,
             'coview_feature_mode': self.coview_feature_mode,
+            'use_causal_coview_feature': self.use_causal_coview_feature,
+            'causal_coview_groups': self.causal_coview_groups,
+            'causal_coview_max_weight': self.causal_coview_max_weight,
             'view_topology_k': self.view_topology_k,
             'view_topology_candidates': self.view_topology_candidates,
             'view_topology_candidate_mode': self.view_topology_candidate_mode,
@@ -2047,6 +2361,9 @@ class GaussianModel(nn.Module):
                 "coview_feature_mode": "full",
                 "view_topology_candidate_mode": "spatial",
                 "view_topology_view_candidates": 16,
+                "use_causal_coview_feature": False,
+                "causal_coview_groups": 4,
+                "causal_coview_max_weight": 0.25,
             }
             saved_value = entropy_context.get(key, legacy_defaults.get(key))
             if saved_value != expected:
@@ -2056,7 +2373,7 @@ class GaussianModel(nn.Module):
                 )
         self.mlp_grid.load_state_dict(entropy_context['grid_mlp'])
         self.mlp_deform.load_state_dict(entropy_context['deform_mlp'])
-        if self.coview_enabled:
+        if self.entropy_extension_enabled:
             if 'coview_model_file' in entropy_context:
                 coview_model_path = os.path.join(
                     pre_path_name, entropy_context['coview_model_file']
@@ -2067,7 +2384,7 @@ class GaussianModel(nn.Module):
                 if coview_metadata != entropy_context['coview_model_metadata']:
                     raise RuntimeError("CoView model blob metadata/checksum mismatch")
                 self.install_coview_serializable_state(coview_state)
-            else:
+            elif self.coview_enabled:
                 # Read Phase 2A/2B packages produced before the deterministic
                 # CoView blob became part of the codec contract.
                 self.mlp_coview_shared.load_state_dict(
@@ -2133,6 +2450,39 @@ class GaussianModel(nn.Module):
                     f"{topology_diagnostics['feature_checksum']} != {expected_checksum}"
                 )
 
+        causal_graph = None
+        causal_feat_decoded = None
+        if self.causal_coview_enabled:
+            causal_graph, causal_diagnostics = self.codec_causal_graph(anchor_decoded)
+            expected_diagnostics = entropy_context['causal_graph_diagnostics']
+            if (
+                causal_diagnostics['graph_checksum']
+                != expected_diagnostics['graph_checksum']
+            ):
+                raise RuntimeError(
+                    "encoder/decoder causal graph checksum mismatch: "
+                    f"{causal_diagnostics['graph_checksum']} != "
+                    f"{expected_diagnostics['graph_checksum']}"
+                )
+            q_feature_all = torch.cat([
+                self.feature_quantization_steps(
+                    anchor_decoded[start:start + MAX_batch_size]
+                )
+                for start in range(0, N, MAX_batch_size)
+            ], dim=0)
+            t_feature_0 = get_time()
+            causal_feat_decoded = decode_causal_feature_symbols(
+                self,
+                self.causal_coview_feature_prior,
+                q_feature_all,
+                anchor_decoded,
+                causal_graph,
+                pre_path_name,
+                batch_size=MAX_batch_size,
+                topology_features=topology_features,
+            )
+            t_feature += get_time() - t_feature_0
+
         for s in range(steps):
 
             N_num = min(MAX_batch_size, N - s*MAX_batch_size)
@@ -2175,27 +2525,30 @@ class GaussianModel(nn.Module):
             Q_scaling = Q_scaling * (1 + torch.tanh(Q_scaling_adj))
             Q_offsets = Q_offsets * (1 + torch.tanh(Q_offsets_adj))
 
-            t_feature_0 = get_time()
-            feat_decoded = torch.zeros(size=[N_num, self.feat_dim], device='cuda', dtype=torch.float32)
-            mean_scale = torch.cat([mean, scale, prob], dim=-1)
-            scale = torch.clamp(scale, min=1e-9)
-            for cc in range(5):
-                mean_adj, scale_adj, prob_adj = self.get_deform_mlp.forward(feat_decoded, mean_scale, to_dec=cc)
-                probs = torch.stack([prob[:, cc*10:cc*10+10], prob_adj], dim=-1)
-                probs = torch.softmax(probs, dim=-1)
-                Q_feat_tmp = Q_feat[:, cc*10:cc*10+10].contiguous().view(-1)
+            if self.causal_coview_enabled:
+                feat_decoded = causal_feat_decoded[N_start:N_end]
+            else:
+                t_feature_0 = get_time()
+                feat_decoded = torch.zeros(size=[N_num, self.feat_dim], device='cuda', dtype=torch.float32)
+                mean_scale = torch.cat([mean, scale, prob], dim=-1)
+                scale = torch.clamp(scale, min=1e-9)
+                for cc in range(5):
+                    mean_adj, scale_adj, prob_adj = self.get_deform_mlp.forward(feat_decoded, mean_scale, to_dec=cc)
+                    probs = torch.stack([prob[:, cc*10:cc*10+10], prob_adj], dim=-1)
+                    probs = torch.softmax(probs, dim=-1)
+                    Q_feat_tmp = Q_feat[:, cc*10:cc*10+10].contiguous().view(-1)
 
-                feat_decoded_tmp = decoder_gaussian_mixed_chunk(
-                    [mean[:, cc*10:cc*10+10].contiguous().view(-1), mean_adj.contiguous().view(-1)],
-                    [scale[:, cc*10:cc*10+10].contiguous().view(-1), scale_adj.contiguous().view(-1)],
-                    [probs[..., 0].contiguous().view(-1), probs[..., 1].contiguous().view(-1)],
-                    Q_feat_tmp,
-                    file_name=feat_b_name.replace('.b', f'_{cc}.b'), chunk_size=50_0000)
+                    feat_decoded_tmp = decoder_gaussian_mixed_chunk(
+                        [mean[:, cc*10:cc*10+10].contiguous().view(-1), mean_adj.contiguous().view(-1)],
+                        [scale[:, cc*10:cc*10+10].contiguous().view(-1), scale_adj.contiguous().view(-1)],
+                        [probs[..., 0].contiguous().view(-1), probs[..., 1].contiguous().view(-1)],
+                        Q_feat_tmp,
+                        file_name=feat_b_name.replace('.b', f'_{cc}.b'), chunk_size=50_0000)
 
-                feat_decoded_tmp = feat_decoded_tmp.view(N_num, 10)
-                feat_decoded[:, cc*10:cc*10+10] = feat_decoded_tmp
+                    feat_decoded_tmp = feat_decoded_tmp.view(N_num, 10)
+                    feat_decoded[:, cc*10:cc*10+10] = feat_decoded_tmp
+                t_feature += get_time() - t_feature_0
             feat_decoded_list.append(feat_decoded)
-            t_feature += get_time() - t_feature_0
 
             t_scaling_0 = get_time()
             scaling_decoded = decoder_gaussian_chunk(mean_scaling, scale_scaling, Q_scaling, file_name=scaling_b_name, chunk_size=10_0000)

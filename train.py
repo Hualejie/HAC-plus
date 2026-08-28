@@ -103,6 +103,10 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         view_topology_view_candidates=dataset.view_topology_view_candidates,
         coview_target=dataset.coview_target,
         coview_feature_mode=dataset.coview_feature_mode,
+        use_causal_coview_feature=dataset.use_causal_coview_feature,
+        causal_coview_groups=dataset.causal_coview_groups,
+        causal_coview_max_weight=dataset.causal_coview_max_weight,
+        causal_coview_gate_init=dataset.causal_coview_gate_init,
         n_features_per_level=args_param.n_features,
         log2_hashmap_size=args_param.log2,
         log2_hashmap_size_2D=args_param.log2_2D,
@@ -159,9 +163,15 @@ def training(args_param, dataset, opt, pipe, dataset_name, testing_iterations, s
         gaussians.update_learning_rate(iteration)
 
         if (
-            gaussians.coview_enabled
+            gaussians.entropy_extension_enabled
             and iteration > opt.update_until
-            and not gaussians.has_training_view_topology
+            and (
+                (gaussians.use_view_topology and not gaussians.has_training_view_topology)
+                or (
+                    gaussians.causal_coview_enabled
+                    and gaussians._training_causal_graph is None
+                )
+            )
         ):
             gaussians.refresh_training_view_topology()
 
@@ -482,6 +492,10 @@ def render_sets(args_param, dataset : ModelParams, iteration : int, pipeline : P
             view_topology_view_candidates=dataset.view_topology_view_candidates,
             coview_target=dataset.coview_target,
             coview_feature_mode=dataset.coview_feature_mode,
+            use_causal_coview_feature=dataset.use_causal_coview_feature,
+            causal_coview_groups=dataset.causal_coview_groups,
+            causal_coview_max_weight=dataset.causal_coview_max_weight,
+            causal_coview_gate_init=dataset.causal_coview_gate_init,
             n_features_per_level=args_param.n_features,
             log2_hashmap_size=args_param.log2,
             log2_hashmap_size_2D=args_param.log2_2D,
