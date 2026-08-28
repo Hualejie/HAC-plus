@@ -13,7 +13,10 @@ if str(REPO_ROOT) in sys.path:
     sys.path.remove(str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
 
-from scene.coview_context import camera_geometry_from_state
+from scene.coview_context import (
+    camera_geometry_from_state,
+    deserialize_camera_geometry,
+)
 from scene.gaussian_model import GaussianModel
 from utils.coview_serialization import deserialize_named_tensors
 
@@ -136,10 +139,16 @@ def main():
     if model.entropy_extension_enabled:
         if not args.camera_context:
             raise ValueError("--camera_context is required for an active CoView target")
-        context = torch.load(args.camera_context)
-        model.configure_view_topology_cameras(
-            camera_geometry_from_state(context["camera_geometry"])
-        )
+        camera_context_path = Path(args.camera_context).resolve()
+        context = torch.load(camera_context_path)
+        if "camera_geometry_file" in context:
+            cameras = deserialize_camera_geometry(
+                camera_context_path.parent / context["camera_geometry_file"],
+                context["camera_geometry_metadata"],
+            )
+        else:
+            cameras = camera_geometry_from_state(context["camera_geometry"])
+        model.configure_view_topology_cameras(cameras)
     model.eval()
     log = model.conduct_encoding(
         str(output_path), coview_serialization=args.coview_serialization
