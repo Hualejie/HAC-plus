@@ -2460,7 +2460,9 @@ class GaussianModel(nn.Module):
                 })
             if self.causal_coview_enabled:
                 causal_graph, causal_diagnostics = self.codec_causal_graph(_anchor)
-                entropy_context['causal_graph_diagnostics'] = causal_diagnostics
+                entropy_context['causal_graph_checksum'] = (
+                    causal_diagnostics['graph_checksum']
+                )
         # The baseline also needs mlp_grid/mlp_deform in a fresh process.  A
         # resident training model is not part of the entropy-decoder contract.
         torch.save(entropy_context, os.path.join(pre_path_name, 'entropy_context.pth'))
@@ -2847,15 +2849,16 @@ class GaussianModel(nn.Module):
         causal_scaling_decoded = None
         if self.causal_coview_enabled:
             causal_graph, causal_diagnostics = self.codec_causal_graph(anchor_decoded)
-            expected_diagnostics = entropy_context['causal_graph_diagnostics']
-            if (
-                causal_diagnostics['graph_checksum']
-                != expected_diagnostics['graph_checksum']
-            ):
+            expected_graph_checksum = entropy_context.get('causal_graph_checksum')
+            if expected_graph_checksum is None:
+                expected_graph_checksum = entropy_context[
+                    'causal_graph_diagnostics'
+                ]['graph_checksum']
+            if causal_diagnostics['graph_checksum'] != expected_graph_checksum:
                 raise RuntimeError(
                     "encoder/decoder causal graph checksum mismatch: "
                     f"{causal_diagnostics['graph_checksum']} != "
-                    f"{expected_diagnostics['graph_checksum']}"
+                    f"{expected_graph_checksum}"
                 )
 
         if self.causal_feature_enabled:
